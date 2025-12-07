@@ -1,0 +1,16 @@
+[project]
+name = "polymarket"
+version = "0.1.0"
+description = "Polymarket Business Intelligence Dashboard"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9.0",
+    "asyncpg>=0.28.0",
+    "requests>=2.31.0",
+    "pandas>=2.1.0",
+    "streamlit>=1.28.0",
+    "plotly>=5.17.0",
+    "python-dotenv>=1.0.0",
+    "sqlalchemy>=2.0.0",
+]
