@@ -40,11 +40,11 @@ class DataNormalizer:
     """Validate and normalize market data."""
     
     @staticmethod
-    def validate_liquidity(liquidity: float, min_liquidity: float = 200000) -> bool:
-        """Ensure minimum liquidity threshold."""
+    def validate_volume(volume: float, min_volume: float = 100000) -> bool:
+        """Ensure minimum volume threshold."""
         try:
-            liq = float(liquidity) if liquidity else 0
-            return liq >= min_liquidity
+            vol = float(volume) if volume else 0
+            return vol >= min_volume
         except:
             return False
     
@@ -74,19 +74,23 @@ class DataNormalizer:
             return False
     
     @staticmethod
-    def normalize(market: dict, min_liquidity: float = 200000) -> dict | None:
+    def normalize(market: dict, min_volume: float = 100000) -> dict | None:
         """Normalize and validate a single market."""
         # Extract required fields
         end_date = market.get('endDate') or market.get('end_date')
         # API can have liquidity or liquidityAmm
         liquidity = float(market.get('liquidity') or market.get('liquidityAmm', 0) or 0)
+        volume = float(market.get('volume', 0) or 0)
+        condition_id = market.get('conditionId')
         outcome_prices = market.get('outcomePrices') or market.get('outcome_prices')
         outcomes = market.get('outcomes')
         
-        # Validate fields
-        if not DataNormalizer.validate_liquidity(liquidity, min_liquidity):
+        # Validate fields - filter by volume instead of liquidity
+        if not DataNormalizer.validate_volume(volume, min_volume):
             return None
         if not DataNormalizer.validate_outcome_prices(outcome_prices):
+            return None
+        if not condition_id:
             return None
         
         # Ensure outcome_prices is stored as JSON string
@@ -120,6 +124,7 @@ class DataNormalizer:
         return {
             'id': market.get('id'),
             'question': market.get('question'),
+            'condition_id': condition_id,
             'liquidity': liquidity,
             'volume': market.get('volume', 0),
             'end_date': end_date,
@@ -134,7 +139,7 @@ class PolymarketPoller:
     """Async fetcher for Polymarket API."""
     
     @staticmethod
-    async def fetch_category(session: aiohttp.ClientSession, category: str, tag_id: int, min_liquidity: float = 200000) -> list:
+    async def fetch_category(session: aiohttp.ClientSession, category: str, tag_id: int, min_volume: float = 100000) -> list:
         """Fetch markets for a single category."""
         try:
             params = {
@@ -147,7 +152,7 @@ class PolymarketPoller:
                     markets = await resp.json()
                     normalized = []
                     for m in markets:
-                        norm = DataNormalizer.normalize(m, min_liquidity)
+                        norm = DataNormalizer.normalize(m, min_volume)
                         if norm:
                             normalized.append(norm)
                     logger.info(f"{category} (tag_id={tag_id}): fetched {len(normalized)} valid markets")
@@ -160,11 +165,11 @@ class PolymarketPoller:
             return []
     
     @staticmethod
-    async def fetch_all_categories(min_liquidity: float = 200000) -> list:
+    async def fetch_all_categories(min_volume: float = 100000) -> list:
         """Fetch all categories concurrently."""
         async with aiohttp.ClientSession() as session:
             tasks = [
-                PolymarketPoller.fetch_category(session, cat, tag_id, min_liquidity)
+                PolymarketPoller.fetch_category(session, cat, tag_id, min_volume)
                 for cat, tag_id in CATEGORIES.items()
             ]
             results = await asyncio.gather(*tasks)
@@ -214,6 +219,7 @@ class DatabaseManager:
                 id TEXT PRIMARY KEY,
                 source_id INTEGER,
                 question TEXT,
+                condition_id TEXT,
                 liquidity REAL,
                 volume REAL,
                 end_date TEXT,
@@ -261,8 +267,8 @@ class DatabaseManager:
         
         for market in markets:
             cursor.execute("""
-                INSERT INTO markets (id, source_id, question, liquidity, volume, end_date, active, outcomes, outcome_prices, probability)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO markets (id, source_id, question, condition_id, liquidity, volume, end_date, active, outcomes, outcome_prices, probability)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     liquidity = excluded.liquidity,
                     volume = excluded.volume,
@@ -273,6 +279,7 @@ class DatabaseManager:
                 market['id'],
                 source_id,
                 market['question'],
+                market['condition_id'],
                 market['liquidity'],
                 market['volume'],
                 market['end_date'],
@@ -307,12 +314,12 @@ class DatabaseManager:
             self.conn.close()
 
 
-async def main(min_liquidity: float = 200000):
+async def main(min_volume: float = 100000):
     """Run the entire ingestion pipeline."""
-    logger.info(f"Starting Polymarket BI ingestion pipeline (min_liquidity=${min_liquidity:,.0f})...")
+    logger.info(f"Starting Polymarket BI ingestion pipeline (min_volume=${min_volume:,.0f})...")
     
     # Fetch markets
-    markets = await PolymarketPoller.fetch_all_categories(min_liquidity)
+    markets = await PolymarketPoller.fetch_all_categories(min_volume)
     logger.info(f"Total valid markets fetched: {len(markets)}")
     
     # Store in database

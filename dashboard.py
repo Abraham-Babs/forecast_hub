@@ -36,21 +36,21 @@ st.set_page_config(
 # Initialize sidebar with controls
 st.sidebar.header("📥 Data Management")
 
-# Liquidity threshold slider
-min_liquidity = st.sidebar.slider(
-    "Minimum Liquidity Threshold ($)",
+# Volume threshold slider
+min_volume = st.sidebar.slider(
+    "Minimum Volume Threshold ($)",
     min_value=1000,
     max_value=1000000,
-    value=200000,
+    value=100000,
     step=10000,
-    help="Only fetch and display markets with liquidity >= this value"
+    help="Only fetch and display markets with volume >= this value"
 )
 
 # Fetch button
 if st.sidebar.button("🔄 Fetch Market Data", key="fetch_button"):
-    with st.spinner(f"Fetching markets with min liquidity ${min_liquidity:,.0f}..."):
+    with st.spinner(f"Fetching markets with min volume ${min_volume:,.0f}..."):
         try:
-            asyncio.run(fetch_data(min_liquidity))
+            asyncio.run(fetch_data(min_volume))
             st.sidebar.success("✓ Data fetched successfully!")
         except Exception as e:
             st.sidebar.error(f"Error fetching data: {e}")
@@ -79,7 +79,7 @@ def load_markets():
     ORDER BY m.liquidity DESC
     """
     df = pd.read_sql_query(query, conn)
-    df['end_date'] = pd.to_datetime(df['end_date'])
+    df['end_date'] = pd.to_datetime(df['end_date'], format='ISO8601', utc=True)
     conn.close()
     return df
 
