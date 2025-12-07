@@ -13,7 +13,7 @@ This fetches market data and launches the Streamlit dashboard at `http://localho
 
 ## How It Works
 
-- **pipeline.py** — Async fetches 13 business-relevant market categories, validates (liquidity, end dates), stores in SQLite
+- **pipeline.py** — Async fetches 13 business-relevant market categories from Polymarket API and OI API, validates (volume, OI, outcomes), stores in SQLite
 - **dashboard.py** — Streamlit visualization with metrics, charts, market search, and filtering
 - **main.py** — Single entry point that runs both pipeline and dashboard
 
@@ -24,14 +24,16 @@ uv sync              # Install dependencies (one-time)
 python main.py       # Fetch data, then launch dashboard
 ```
 
-## Data Source
+## Data Sources
 
-Polymarket API: `https://gamma-api.polymarket.com/markets`
+- **Markets API:** `https://gamma-api.polymarket.com/markets`
+- **Open Interest API:** `https://data-api.polymarket.com/oi`
 
 Markets are fetched from 13 business-relevant categories and filtered by:
-- Volume ≥ $100,000
-- End date in the future
+- Volume ≥ $100,000 (configurable, default)
+- Open Interest ≥ $50,000 (configurable, default)
 - Valid outcome prices (0-1 range)
+- Condition ID present
 
 Database: SQLite (`polymarket_bi.db`)
 
@@ -102,7 +104,7 @@ The Streamlit dashboard provides real-time visualization of market data:
 
 - **Market Discovery:**
   - Search markets by keyword/question
-  - Filter by minimum liquidity threshold
+  - Filter by minimum volume and OI thresholds
   - View market details and probabilities
 
 - **Visualizations:**
@@ -123,7 +125,7 @@ The Streamlit dashboard provides real-time visualization of market data:
 python main.py
 ```
 
-Fetches ~50 markets from all categories, stores in SQLite, and launches dashboard at `http://localhost:8501`.
+Fetches markets meeting filtering criteria (volume ≥ $100k, OI ≥ $50k) from all 13 categories, stores in SQLite, and launches dashboard at `http://localhost:8501`.
 
 ### Dashboard Only
 
@@ -161,8 +163,10 @@ polymarket/
 ### Markets Table
 - `id` — Market identifier
 - `question` — Market question text
+- `condition_id` — Polymarket condition ID (unique market identifier)
 - `liquidity` — Available liquidity in USD
 - `volume` — Total volume traded in USD
+- `open_interest` — Open interest in USD
 - `end_date` — Market expiration date
 - `active` — Whether market is currently active
 - `outcomes` — JSON array of outcome labels (e.g., ["Yes", "No"])

@@ -16,6 +16,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 API_BASE = "https://gamma-api.polymarket.com/markets"
+OI_API_BASE = "https://data-api.polymarket.com/oi"
 
 # Business-relevant prediction market categories with Polymarket tag_ids
 # From README: 13 categories with specific tag_id values
@@ -70,6 +71,15 @@ class DataNormalizer:
                     return False
             
             return True
+        except:
+            return False
+    
+    @staticmethod
+    def validate_open_interest(oi: float, min_oi: float = 50000) -> bool:
+        """Ensure minimum open interest threshold."""
+        try:
+            oi_val = float(oi) if oi else 0
+            return oi_val >= min_oi
         except:
             return False
     
@@ -132,6 +142,7 @@ class DataNormalizer:
             'outcomes': outcomes_str,
             'outcome_prices': outcome_prices_str,
             'probability': probability,
+            'open_interest': None,
         }
 
 
@@ -139,8 +150,27 @@ class PolymarketPoller:
     """Async fetcher for Polymarket API."""
     
     @staticmethod
+    async def fetch_open_interest(session: aiohttp.ClientSession, condition_id: str) -> float | None:
+        """Fetch open interest for a market by condition ID."""
+        try:
+            params = {"market": condition_id}
+            async with session.get(OI_API_BASE, params=params, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    # OI endpoint returns a list with one dict containing 'value'
+                    if isinstance(data, list) and len(data) > 0:
+                        oi = data[0].get('value')
+                        if oi is not None:
+                            return float(oi)
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            pass
+        return None
+    
+    @staticmethod
     async def fetch_category(session: aiohttp.ClientSession, category: str, tag_id: int, min_volume: float = 100000) -> list:
-        """Fetch markets for a single category."""
+        """Fetch markets for a single category (raw, without OI filtering)."""
         try:
             params = {
                 "tag_id": tag_id,
@@ -165,25 +195,41 @@ class PolymarketPoller:
             return []
     
     @staticmethod
-    async def fetch_all_categories(min_volume: float = 100000) -> list:
-        """Fetch all categories concurrently."""
-        async with aiohttp.ClientSession() as session:
+    async def fetch_all_categories(min_volume: float = 100000, min_oi: float = 50000) -> list:
+        """Fetch all categories concurrently, then filter by OI across all markets."""
+        connector = aiohttp.TCPConnector(limit_per_host=20, limit=200)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Step 1: Fetch all category markets in parallel
             tasks = [
                 PolymarketPoller.fetch_category(session, cat, tag_id, min_volume)
                 for cat, tag_id in CATEGORIES.items()
             ]
             results = await asyncio.gather(*tasks)
+            all_markets = [m for batch in results for m in batch]
             
-        # Flatten and deduplicate by market ID
-        all_markets = []
-        seen_ids = set()
-        for result in results:
-            for market in result:
-                if market['id'] not in seen_ids:
-                    all_markets.append(market)
-                    seen_ids.add(market['id'])
-        
-        return all_markets
+            # Step 2: Fetch OI for ALL markets in parallel (no semaphore for speed)
+            oi_tasks = [
+                PolymarketPoller.fetch_open_interest(session, m.get('condition_id'))
+                for m in all_markets if m.get('condition_id')
+            ]
+            oi_values = await asyncio.gather(*oi_tasks)
+            
+            # Step 3: Attach OI and filter by threshold
+            oi_dict = {
+                m.get('condition_id'): oi
+                for m, oi in zip([m for m in all_markets if m.get('condition_id')], oi_values)
+            }
+            
+            filtered = []
+            for market in all_markets:
+                condition_id = market.get('condition_id')
+                if condition_id and condition_id in oi_dict:
+                    oi = oi_dict[condition_id]
+                    if oi and DataNormalizer.validate_open_interest(oi, min_oi):
+                        market['open_interest'] = oi
+                        filtered.append(market)
+            
+            return filtered
 
 
 class DatabaseManager:
@@ -222,6 +268,7 @@ class DatabaseManager:
                 condition_id TEXT,
                 liquidity REAL,
                 volume REAL,
+                open_interest REAL,
                 end_date TEXT,
                 active BOOLEAN,
                 outcomes TEXT,
@@ -266,12 +313,17 @@ class DatabaseManager:
         updated_count = 0
         
         for market in markets:
+            # Check if market already exists
+            cursor.execute("SELECT id FROM markets WHERE id = ?", (market['id'],))
+            exists = cursor.fetchone() is not None
+            
             cursor.execute("""
-                INSERT INTO markets (id, source_id, question, condition_id, liquidity, volume, end_date, active, outcomes, outcome_prices, probability)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO markets (id, source_id, question, condition_id, liquidity, volume, open_interest, end_date, active, outcomes, outcome_prices, probability)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     liquidity = excluded.liquidity,
                     volume = excluded.volume,
+                    open_interest = excluded.open_interest,
                     outcomes = excluded.outcomes,
                     outcome_prices = excluded.outcome_prices,
                     probability = excluded.probability
@@ -282,6 +334,7 @@ class DatabaseManager:
                 market['condition_id'],
                 market['liquidity'],
                 market['volume'],
+                market['open_interest'],
                 market['end_date'],
                 market['active'],
                 market['outcomes'],
@@ -289,10 +342,10 @@ class DatabaseManager:
                 market['probability'],
             ))
             
-            if cursor.rowcount == 1:
-                new_count += 1
-            else:
+            if exists:
                 updated_count += 1
+            else:
+                new_count += 1
             
             # Insert snapshot
             cursor.execute("""
@@ -314,12 +367,12 @@ class DatabaseManager:
             self.conn.close()
 
 
-async def main(min_volume: float = 100000):
+async def main(min_volume: float = 100000, min_oi: float = 50000):
     """Run the entire ingestion pipeline."""
-    logger.info(f"Starting Polymarket BI ingestion pipeline (min_volume=${min_volume:,.0f})...")
+    logger.info(f"Starting Polymarket BI ingestion pipeline (min_volume=${min_volume:,.0f}, min_oi=${min_oi:,.0f})...")
     
     # Fetch markets
-    markets = await PolymarketPoller.fetch_all_categories(min_volume)
+    markets = await PolymarketPoller.fetch_all_categories(min_volume, min_oi)
     logger.info(f"Total valid markets fetched: {len(markets)}")
     
     # Store in database
