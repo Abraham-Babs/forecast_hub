@@ -312,8 +312,15 @@ with st.sidebar:
     
     st.divider()
     
-    # Category/tag filtering
-    available_categories = sorted(df['category'].dropna().unique().tolist()) if 'category' in df.columns and len(df) > 0 else []
+    # Category/tag filtering - only show categories with active markets
+    if 'category' in df.columns and len(df) > 0:
+        # Count markets per category
+        category_counts = df['category'].value_counts().sort_index()
+        # Only include categories with at least one market
+        available_categories = sorted([cat for cat in category_counts[category_counts > 0].index.tolist()])
+    else:
+        available_categories = []
+    
     selected_categories = st.multiselect(
         "Market Categories",
         available_categories if available_categories else ["No categories found"],
@@ -336,12 +343,21 @@ with st.sidebar:
     
     st.divider()
     
-    # Probability range
+    # Probability range filtering with business context
+    st.write("**Probability Conviction Range**")
     prob_min, prob_max = st.slider(
-        "Probability Range",
+        "Filter markets by YES probability",
         0, 100, (0, 100),
-        help="Filter by 'Yes' probability range"
+        help="Show markets where the crowd thinks YES has between X% and Y% chance. Use to find consensus or disagreement zones."
     )
+    
+    # Show what this range means
+    if prob_min > 60 or prob_max < 40:
+        st.caption("🎯 Showing high conviction markets (crowd strongly agrees)")
+    elif 40 <= prob_min and prob_max <= 60:
+        st.caption("⚖️ Showing balanced markets (crowd is split)")
+    else:
+        st.caption("🔍 Showing full spectrum of market opinions")
     
     st.divider()
     
