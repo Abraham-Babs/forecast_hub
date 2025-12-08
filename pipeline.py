@@ -8,15 +8,25 @@ import asyncio
 import json
 import sqlite3
 import logging
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 from typing import Any
+from dotenv import load_dotenv
 import aiohttp
+
+# Load environment variables
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-API_BASE = "https://gamma-api.polymarket.com/markets"
-OI_API_BASE = "https://data-api.polymarket.com/oi"
+# Configuration from environment
+API_BASE = os.getenv("API_BASE_URL", "https://gamma-api.polymarket.com/markets")
+OI_API_BASE = os.getenv("OI_API_BASE_URL", "https://data-api.polymarket.com/oi")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "polymarket_bi.db")
+API_TIMEOUT = int(os.getenv("API_TIMEOUT_SECONDS", "10"))
+API_RATE_LIMIT_PER_HOST = int(os.getenv("API_RATE_LIMIT_PER_HOST", "20"))
+API_RATE_LIMIT_TOTAL = int(os.getenv("API_RATE_LIMIT_TOTAL", "200"))
 
 # Business-relevant prediction market categories with Polymarket tag_ids
 # From README: 13 categories with specific tag_id values
@@ -46,7 +56,8 @@ class DataNormalizer:
         try:
             vol = float(volume) if volume else 0
             return vol >= min_volume
-        except:
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Volume validation error: {e}")
             return False
     
     @staticmethod
@@ -67,11 +78,16 @@ class DataNormalizer:
                     float_p = float(p)
                     if not (0 <= float_p <= 1):
                         return False
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as e:
+                    logger.debug(f"Outcome price conversion error: {e}")
                     return False
             
             return True
-        except:
+        except json.JSONDecodeError as e:
+            logger.debug(f"JSON decode error in outcome_prices: {e}")
+            return False
+        except Exception as e:
+            logger.debug(f"Unexpected error validating outcome prices: {e}")
             return False
     
     @staticmethod
@@ -80,7 +96,8 @@ class DataNormalizer:
         try:
             oi_val = float(oi) if oi else 0
             return oi_val >= min_oi
-        except:
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Open interest validation error: {e}")
             return False
     
     @staticmethod
@@ -177,7 +194,7 @@ class PolymarketPoller:
                 "closed": "false",
                 "limit": 300,
             }
-            async with session.get(API_BASE, params=params) as resp:
+            async with session.get(API_BASE, params=params, timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)) as resp:
                 if resp.status == 200:
                     markets = await resp.json()
                     normalized = []
@@ -190,44 +207,61 @@ class PolymarketPoller:
                 else:
                     logger.warning(f"{category}: HTTP {resp.status}")
                     return []
+        except asyncio.TimeoutError:
+            logger.error(f"{category}: Request timeout after {API_TIMEOUT}s")
+            return []
+        except aiohttp.ClientError as e:
+            logger.error(f"{category}: HTTP client error - {e}")
+            return []
+        except json.JSONDecodeError as e:
+            logger.error(f"{category}: Invalid JSON response - {e}")
+            return []
         except Exception as e:
-            logger.error(f"{category}: {e}")
+            logger.error(f"{category}: Unexpected error - {type(e).__name__}: {e}")
             return []
     
     @staticmethod
     async def fetch_all_categories(min_volume: float = 100000, min_oi: float = 50000) -> list:
         """Fetch all categories concurrently, then filter by OI across all markets."""
-        connector = aiohttp.TCPConnector(limit_per_host=20, limit=200)
+        connector = aiohttp.TCPConnector(limit_per_host=API_RATE_LIMIT_PER_HOST, limit=API_RATE_LIMIT_TOTAL)
         async with aiohttp.ClientSession(connector=connector) as session:
             # Step 1: Fetch all category markets in parallel
             tasks = [
                 PolymarketPoller.fetch_category(session, cat, tag_id, min_volume)
                 for cat, tag_id in CATEGORIES.items()
             ]
-            results = await asyncio.gather(*tasks)
-            all_markets = [m for batch in results for m in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            all_markets = []
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    category = list(CATEGORIES.keys())[i]
+                    logger.error(f"Failed to fetch category {category}: {result}")
+                else:
+                    all_markets.extend(result)
             
-            # Step 2: Fetch OI for ALL markets in parallel (no semaphore for speed)
+            # Step 2: Fetch OI for ALL markets in parallel with proper indexing
+            markets_with_oi = [m for m in all_markets if m.get('condition_id')]
             oi_tasks = [
                 PolymarketPoller.fetch_open_interest(session, m.get('condition_id'))
-                for m in all_markets if m.get('condition_id')
+                for m in markets_with_oi
             ]
-            oi_values = await asyncio.gather(*oi_tasks)
+            oi_values = await asyncio.gather(*oi_tasks, return_exceptions=True)
             
-            # Step 3: Attach OI and filter by threshold
-            oi_dict = {
-                m.get('condition_id'): oi
-                for m, oi in zip([m for m in all_markets if m.get('condition_id')], oi_values)
-            }
-            
+            # Step 3: Attach OI and filter by threshold (explicit indexing to avoid mismatch)
             filtered = []
-            for market in all_markets:
-                condition_id = market.get('condition_id')
-                if condition_id and condition_id in oi_dict:
-                    oi = oi_dict[condition_id]
-                    if oi and DataNormalizer.validate_open_interest(oi, min_oi):
-                        market['open_interest'] = oi
-                        filtered.append(market)
+            for market, oi_result in zip(markets_with_oi, oi_values):
+                if isinstance(oi_result, Exception):
+                    logger.warning(f"Failed to fetch OI for market {market.get('id')}: {oi_result}")
+                    continue
+                
+                oi = oi_result
+                if oi is not None and DataNormalizer.validate_open_interest(oi, min_oi):
+                    market['open_interest'] = oi
+                    filtered.append(market)
+            
+            # Add markets without OI (may not have OI data available)
+            markets_without_oi = [m for m in all_markets if not m.get('condition_id')]
+            filtered.extend(markets_without_oi)
             
             return filtered
 
@@ -235,8 +269,8 @@ class PolymarketPoller:
 class DatabaseManager:
     """SQLite database operations."""
     
-    def __init__(self, db_path: str = "polymarket_bi.db"):
-        self.db_path = db_path
+    def __init__(self, db_path: str | None = None):
+        self.db_path = db_path or DATABASE_PATH
         self.conn = None
     
     def connect(self):
@@ -289,6 +323,15 @@ class DatabaseManager:
                 volume REAL,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(market_id) REFERENCES markets(id)
+            )
+        """)
+        
+        # Metadata table (tracks last refresh, counts, etc)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
@@ -358,7 +401,14 @@ class DatabaseManager:
                 market['volume'],
             ))
         
+        # Record last refresh timestamp
+        cursor.execute("""
+            INSERT OR REPLACE INTO metadata (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        """, ("last_refresh", datetime.now(timezone.utc).isoformat()))
+        
         self.conn.commit()
+        logger.info(f"Recorded refresh timestamp: {new_count} new, {updated_count} updated")
         return new_count, updated_count
     
     def close(self):
@@ -367,23 +417,38 @@ class DatabaseManager:
             self.conn.close()
 
 
-async def main(min_volume: float = 100000, min_oi: float = 50000):
+async def main(min_volume: float | None = None, min_oi: float | None = None):
     """Run the entire ingestion pipeline."""
+    # Use environment defaults if not provided
+    if min_volume is None:
+        min_volume = float(os.getenv("MIN_VOLUME_USD", "100000"))
+    if min_oi is None:
+        min_oi = float(os.getenv("MIN_OPEN_INTEREST_USD", "50000"))
+    
     logger.info(f"Starting Polymarket BI ingestion pipeline (min_volume=${min_volume:,.0f}, min_oi=${min_oi:,.0f})...")
     
-    # Fetch markets
-    markets = await PolymarketPoller.fetch_all_categories(min_volume, min_oi)
-    logger.info(f"Total valid markets fetched: {len(markets)}")
-    
-    # Store in database
-    db = DatabaseManager()
-    db.connect()
-    db.init_schema()
-    new, updated = db.insert_markets(markets)
-    logger.info(f"Database: {new} new markets, {updated} updated")
-    db.close()
-    
-    logger.info("Ingestion pipeline completed")
+    try:
+        # Fetch markets
+        markets = await PolymarketPoller.fetch_all_categories(min_volume, min_oi)
+        logger.info(f"Total valid markets fetched: {len(markets)}")
+        
+        if not markets:
+            logger.warning("No markets fetched. Pipeline completed with no data.")
+            return 0
+        
+        # Store in database
+        db = DatabaseManager()
+        db.connect()
+        db.init_schema()
+        new, updated = db.insert_markets(markets)
+        logger.info(f"Database: {new} new markets, {updated} updated")
+        db.close()
+        
+        logger.info("Ingestion pipeline completed successfully")
+        return 0
+    except Exception as e:
+        logger.error(f"Pipeline failed: {type(e).__name__}: {e}", exc_info=True)
+        return 1
 
 
 if __name__ == "__main__":
