@@ -159,6 +159,13 @@ def parse_json_field(json_str):
 # Load market data first
 df = load_markets()
 
+# Show staleness warning if data is old
+refresh_status, status_color = get_refresh_status()
+if "stale" in refresh_status.lower():
+    st.warning(f"⚠️ {refresh_status} - Data may be outdated. Live updates temporarily unavailable.")
+elif "never" in refresh_status.lower():
+    st.error("❌ No data available. Pipeline has not run yet.")
+
 if len(df) == 0:
     st.warning("⚠️ No data in database. Please run the data pipeline first.")
     st.info("Run: `python main.py`")

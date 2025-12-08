@@ -341,6 +341,12 @@ class DatabaseManager:
             VALUES (?, ?)
         """, ("Polymarket", API_BASE))
         
+        # Create indexes for fast filtering queries
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_markets_probability ON markets(probability)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_markets_open_interest ON markets(open_interest)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_markets_end_date ON markets(end_date)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_markets_active ON markets(active)")
+        
         self.conn.commit()
         logger.info("Database schema initialized")
     
@@ -415,10 +421,32 @@ class DatabaseManager:
         """Close database connection."""
         if self.conn:
             self.conn.close()
+    
+    def load_cached_markets(self) -> list | None:
+        """Load all markets from cache (for API failure fallback)."""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT id, source_id, question, condition_id, liquidity, volume, 
+                       open_interest, end_date, active, outcomes, outcome_prices, probability
+                FROM markets
+                ORDER BY open_interest DESC
+            """)
+            rows = cursor.fetchall()
+            
+            if not rows:
+                logger.warning("No cached markets available in database")
+                return None
+            
+            logger.info(f"Loaded {len(rows)} cached markets from database")
+            return rows
+        except sqlite3.Error as e:
+            logger.error(f"Failed to load cached markets: {e}")
+            return None
 
 
 async def main(min_volume: float | None = None, min_oi: float | None = None):
-    """Run the entire ingestion pipeline."""
+    """Run the entire ingestion pipeline with graceful degradation."""
     # Use environment defaults if not provided
     if min_volume is None:
         min_volume = float(os.getenv("MIN_VOLUME_USD", "100000"))
@@ -428,24 +456,60 @@ async def main(min_volume: float | None = None, min_oi: float | None = None):
     logger.info(f"Starting Polymarket BI ingestion pipeline (min_volume=${min_volume:,.0f}, min_oi=${min_oi:,.0f})...")
     
     try:
-        # Fetch markets
-        markets = await PolymarketPoller.fetch_all_categories(min_volume, min_oi)
-        logger.info(f"Total valid markets fetched: {len(markets)}")
-        
-        if not markets:
-            logger.warning("No markets fetched. Pipeline completed with no data.")
+        # Fetch markets with error handling
+        try:
+            markets = await PolymarketPoller.fetch_all_categories(min_volume, min_oi)
+            logger.info(f"Total valid markets fetched: {len(markets)}")
+            
+            if not markets:
+                logger.warning("No markets fetched from API. Checking for cached data...")
+                # Try to load cached data
+                db = DatabaseManager()
+                db.connect()
+                db.init_schema()
+                cached_markets = db.load_cached_markets()
+                if cached_markets:
+                    logger.info(f"Loaded {len(cached_markets)} markets from cache (API failure fallback)")
+                    db.close()
+                    return 0
+                else:
+                    logger.error("No cached data available. Pipeline completed with no data.")
+                    db.close()
+                    return 1
+            
+            # Store fresh data in database
+            db = DatabaseManager()
+            db.connect()
+            db.init_schema()
+            new, updated = db.insert_markets(markets)
+            logger.info(f"Database: {new} new markets, {updated} updated")
+            db.close()
+            
+            logger.info("Ingestion pipeline completed successfully")
             return 0
-        
-        # Store in database
-        db = DatabaseManager()
-        db.connect()
-        db.init_schema()
-        new, updated = db.insert_markets(markets)
-        logger.info(f"Database: {new} new markets, {updated} updated")
-        db.close()
-        
-        logger.info("Ingestion pipeline completed successfully")
-        return 0
+            
+        except Exception as fetch_error:
+            logger.error(f"API fetch failed: {type(fetch_error).__name__}: {fetch_error}", exc_info=False)
+            logger.info("Attempting to use cached data as fallback...")
+            
+            # Try to load cached data when API fails
+            try:
+                db = DatabaseManager()
+                db.connect()
+                db.init_schema()
+                cached_markets = db.load_cached_markets()
+                if cached_markets:
+                    logger.info(f"Gracefully degraded: Using {len(cached_markets)} markets from cache")
+                    db.close()
+                    return 0
+                else:
+                    logger.error("No cached data available for fallback")
+                    db.close()
+                    return 1
+            except Exception as cache_error:
+                logger.error(f"Cache fallback also failed: {type(cache_error).__name__}: {cache_error}")
+                return 1
+                
     except Exception as e:
         logger.error(f"Pipeline failed: {type(e).__name__}: {e}", exc_info=True)
         return 1
