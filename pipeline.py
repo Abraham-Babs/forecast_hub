@@ -27,6 +27,9 @@ API_BASE = os.getenv("API_BASE_URL", "https://gamma-api.polymarket.com/markets")
 OI_API_BASE = os.getenv("OI_API_BASE_URL", "https://data-api.polymarket.com/oi")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "polymarket_bi.db")
 API_TIMEOUT = int(os.getenv("API_TIMEOUT_SECONDS", "10"))
+# OI endpoint needs longer timeout because it fetches for ALL markets sequentially
+# Increased from 3s to 8s to ensure complete data retrieval on each market
+OI_API_TIMEOUT = int(os.getenv("OI_API_TIMEOUT_SECONDS", "8"))
 API_RATE_LIMIT_PER_HOST = int(os.getenv("API_RATE_LIMIT_PER_HOST", "20"))
 API_RATE_LIMIT_TOTAL = int(os.getenv("API_RATE_LIMIT_TOTAL", "200"))
 
@@ -173,7 +176,8 @@ class PolymarketPoller:
         """Fetch open interest for a market by condition ID."""
         try:
             params = {"market": condition_id}
-            async with session.get(OI_API_BASE, params=params, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+            # Use OI_API_TIMEOUT (8s) instead of 3s - OI fetch is slower due to sequential nature
+            async with session.get(OI_API_BASE, params=params, timeout=aiohttp.ClientTimeout(total=OI_API_TIMEOUT)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     # OI endpoint returns a list with one dict containing 'value'
