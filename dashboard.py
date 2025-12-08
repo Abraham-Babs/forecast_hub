@@ -10,11 +10,23 @@ import sqlite3
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timezone
 import json
+import logging
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Database configuration
+DATABASE_PATH = os.getenv("DATABASE_PATH", "polymarket_bi.db")
 
 # Ensure database can be found
-if not os.path.exists("polymarket_bi.db"):
+if not os.path.exists(DATABASE_PATH):
     if os.path.exists(os.path.join(os.path.dirname(__file__), "..")):
         os.chdir(os.path.dirname(__file__) or ".")
 
@@ -23,20 +35,27 @@ if not os.path.exists("polymarket_bi.db"):
 # ============================================================================
 
 st.set_page_config(
-    page_title="Polymarket BI Dashboard",
-    page_icon="📊",
-    layout="wide"
+    page_title="Polymarket Business Intelligence",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
 
+@st.cache_resource
 def get_db_connection():
-    """Create fresh database connection."""
-    conn = sqlite3.connect("polymarket_bi.db", check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Create database connection (cached for reuse)."""
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error as e:
+        logger.error(f"Database connection failed: {e}")
+        st.error(f"Failed to connect to database: {e}")
+        st.stop()
 
 def get_max_open_interest():
     """Get maximum open interest value from database."""
@@ -45,206 +64,431 @@ def get_max_open_interest():
         cursor = conn.cursor()
         cursor.execute("SELECT MAX(open_interest) FROM markets WHERE open_interest > 0")
         result = cursor.fetchone()
-        conn.close()
-        return int(result[0]) if result[0] else 500_000_000
-    except:
+        return int(result[0]) if result and result[0] else 500_000_000
+    except sqlite3.Error as e:
+        logger.error(f"Failed to fetch max OI: {e}")
         return 500_000_000
+
+def get_last_refresh_time():
+    """Get last data refresh timestamp from metadata table."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM metadata WHERE key = ? ORDER BY updated_at DESC LIMIT 1", ("last_refresh",))
+        result = cursor.fetchone()
+        if result and result[0]:
+            return result[0]
+    except sqlite3.Error as e:
+        logger.debug(f"Could not fetch refresh timestamp: {e}")
+    return None
+
+def get_refresh_status():
+    """Get human-readable refresh status with staleness indicator."""
+    last_refresh = get_last_refresh_time()
+    if not last_refresh:
+        return "⚠️ Never refreshed", "red"
+    
+    try:
+        last_dt = pd.to_datetime(last_refresh, utc=True)
+        now_dt = datetime.now(timezone.utc)
+        delta = now_dt - last_dt
+        
+        minutes_ago = int(delta.total_seconds() / 60)
+        if minutes_ago < 1:
+            return "✅ Just updated", "green"
+        elif minutes_ago < 30:
+            return f"✅ Updated {minutes_ago}m ago", "green"
+        elif minutes_ago < 60:
+            return f"🟡 Updated {minutes_ago}m ago", "orange"
+        else:
+            hours_ago = minutes_ago // 60
+            return f"⚠️ Updated {hours_ago}h ago (stale)", "red"
+    except Exception as e:
+        logger.debug(f"Error computing refresh status: {e}")
+        return "❓ Unknown", "gray"
 
 def load_markets():
     """Load all markets from database."""
-    conn = get_db_connection()
-    query = """
-    SELECT 
-        id,
-        question,
-        condition_id,
-        volume,
-        open_interest,
-        end_date,
-        active,
-        outcomes,
-        outcome_prices,
-        probability
-    FROM markets
-    ORDER BY open_interest DESC
-    """
-    df = pd.read_sql_query(query, conn)
-    df['end_date'] = pd.to_datetime(df['end_date'], format='ISO8601', utc=True)
-    conn.close()
-    return df
+    try:
+        conn = get_db_connection()
+        query = """
+        SELECT 
+            id,
+            question,
+            condition_id,
+            volume,
+            open_interest,
+            end_date,
+            active,
+            outcomes,
+            outcome_prices,
+            probability
+        FROM markets
+        ORDER BY open_interest DESC
+        """
+        df = pd.read_sql_query(query, conn)
+        
+        if len(df) == 0:
+            return df
+        
+        # Safely parse dates
+        try:
+            df['end_date'] = pd.to_datetime(df['end_date'], format='ISO8601', utc=True)
+        except Exception as e:
+            logger.warning(f"Date parsing failed: {e}. Using fallback parsing.")
+            df['end_date'] = pd.to_datetime(df['end_date'], errors='coerce')
+        
+        return df
+    except sqlite3.Error as e:
+        logger.error(f"Failed to load markets: {e}")
+        st.error(f"Failed to load market data: {e}")
+        return pd.DataFrame()
 
 def parse_json_field(json_str):
     """Parse JSON string safely."""
     try:
         return json.loads(json_str) if json_str else []
-    except:
+    except json.JSONDecodeError as e:
+        logger.warning(f"JSON parse error: {e}")
         return []
+
+# ============================================================================
+# MAIN CONTENT STARTS HERE
+# ============================================================================
+
+# Load market data first
+df = load_markets()
+
+if len(df) == 0:
+    st.warning("⚠️ No data in database. Please run the data pipeline first.")
+    st.info("Run: `python main.py`")
+    st.stop()
+
+# Prepare filtering variables
+max_open_interest = get_max_open_interest()
+open_interest_step = max(1000, max_open_interest // 100)
 
 # ============================================================================
 # SIDEBAR CONTROLS
 # ============================================================================
 
-st.sidebar.header("🎚️ Open Interest Filter")
+with st.sidebar:
+    st.header("🎚️ Filters")
+    
+    # Open Interest threshold slider
+    min_open_interest = st.slider(
+        "Minimum Open Interest ($)",
+        min_value=50_000,
+        max_value=max_open_interest,
+        value=50_000,
+        step=open_interest_step,
+        format="$%d",
+        help="Markets below this liquidity level are excluded"
+    )
+    
+    st.divider()
+    
+    # Probability range
+    prob_min, prob_max = st.slider(
+        "Probability Range",
+        0, 100, (0, 100),
+        help="Filter by 'Yes' probability range"
+    )
+    
+    st.divider()
+    
+    # Time to expiration with smart bucketing
+    df_temp = load_markets()
+    df_temp['days_left'] = (df_temp['end_date'] - datetime.now(timezone.utc)).dt.days
+    max_days = int(df_temp['days_left'].max()) if len(df_temp) > 0 else 365
+    
+    st.write("**Market Timeline**")
+    time_bucket = st.radio(
+        "When do you want markets to resolve?",
+        ["Today (0-1 days)", "This Week (2-7 days)", "Next 30 Days (8-30 days)", "All Markets"],
+        horizontal=True,
+        help="Markets resolving sooner are more informative; longer-dated markets are more speculative"
+    )
+    
+    if time_bucket == "Today (0-1 days)":
+        time_min, time_max = 0, 1
+    elif time_bucket == "This Week (2-7 days)":
+        time_min, time_max = 2, 7
+    elif time_bucket == "Next 30 Days (8-30 days)":
+        time_min, time_max = 8, 30
+    else:
+        time_min, time_max = 0, max_days
+    
+    st.divider()
+    
+    # About
+    with st.expander("ℹ️ Business Intelligence Guide"):
+        st.write("""
+**Key Metrics Explained:**
 
-# Get max open interest from database
-max_open_interest = get_max_open_interest()
-open_interest_step = max(1000, max_open_interest // 100)
+- **Probability %** - Market's implicit forecast (higher = more certain)
+- **Open Interest (OI)** - Capital at risk in this market (higher = more reliable signal)
+- **24h Volume** - Recent trading activity (shows market engagement)
+- **Days to Resolution** - Time remaining (shorter = more informative, longer = more speculative)
+- **Market Maturity** - Today = near-final predictions, Week = active forecasts, 30+ days = speculative
 
-# Open Interest threshold slider
-min_open_interest = st.sidebar.slider(
-    "Minimum Open Interest ($)",
-    min_value=50_000,
-    max_value=max_open_interest,
-    value=200_000,
-    step=open_interest_step,
-    format="$%d",
-    help="Only show markets with open interest >= this value"
-)
+**How to use this dashboard:**
 
-st.sidebar.divider()
+1. **Find Consensus** - Markets above 70% or below 30% show strong expert agreement
+2. **Spot Disagreement** - Markets near 50/50 highlight where opinion diverges (risk zones)
+3. **Trust Older Predictions** - Markets resolved soon carry more predictive weight
+4. **Check Liquidity** - Higher OI = more reliable prices; low OI = potentially noisy
 
-# Glossary
-with st.sidebar.expander("ℹ️ About This Dashboard"):
-    st.write("""
-**Open Interest**: Total USD value of all outstanding/active contracts in a market. 
-Higher open interest indicates more trading activity and market interest.
-
-**Probability**: Implied probability that the "Yes" outcome will occur, based on 
-current market prices.
-
-**Volume**: Total USD value of contracts traded in this market.
+**Business Use Cases:**
+- Forecast planning (What does the market predict?)
+- Risk assessment (Where is opinion split?)
+- Decision timing (When is conviction strongest?)
+- Hedging (Which outcomes are underpriced?)
 """)
+
 
 # ============================================================================
 # MAIN DASHBOARD
 # ============================================================================
 
-st.title("📊 Polymarket Business Intelligence Dashboard")
+st.title("📈 Business Prediction Market Intelligence")
+st.markdown("**Real-time consensus analysis for strategic decision-making**")
 
-# Load data
-df = load_markets()
+# Apply filters
+df_filtered = df[
+    (df['open_interest'] >= min_open_interest) &
+    (df['probability'] >= prob_min) &
+    (df['probability'] <= prob_max)
+].copy()
 
-if len(df) == 0:
-    st.warning("No data in database. Please run the data pipeline.")
-    st.stop()
+# Calculate days left for time filtering
+df_filtered['days_left'] = (df_filtered['end_date'] - datetime.now(timezone.utc)).dt.days
+df_filtered = df_filtered[
+    (df_filtered['days_left'] >= time_min) &
+    (df_filtered['days_left'] <= time_max)
+]
 
-# Filter by open interest threshold
-df_filtered = df[df['open_interest'] >= min_open_interest].copy()
+# Add market maturity category for display
+def get_maturity(days):
+    if days <= 1:
+        return "🔴 FINAL VERDICT"
+    elif days <= 7:
+        return "🟡 ACTIVE"
+    else:
+        return "🔵 SPECULATIVE"
+
+df_filtered['maturity'] = df_filtered['days_left'].apply(get_maturity)
 
 # ============================================================================
-# KEY METRICS
+# BUSINESS INSIGHTS SECTION
 # ============================================================================
+
+st.subheader("🎯 Market Consensus Analysis")
 
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    st.metric("Total Markets", len(df_filtered))
+    # High consensus markets (>70% or <30%)
+    high_consensus = (
+        (df_filtered['probability'] > 70) | 
+        (df_filtered['probability'] < 30)
+    ).sum()
+    st.metric(
+        "🎯 High Conviction",
+        high_consensus,
+        f"{high_consensus/len(df_filtered)*100 if len(df_filtered) > 0 else 0:.0f}% of markets",
+        help="Markets where experts strongly agree (>70% or <30%)"
+    )
 
 with col2:
-    avg_oi = df_filtered['open_interest'].mean() if len(df_filtered) > 0 else 0
-    st.metric("Average Open Interest", f"${avg_oi:,.0f}")
+    # Disagreement markets (40-60%)
+    disagreement = (
+        (df_filtered['probability'] > 40) & 
+        (df_filtered['probability'] < 60)
+    ).sum()
+    st.metric(
+        "⚖️ Balanced View",
+        disagreement,
+        f"{disagreement/len(df_filtered)*100 if len(df_filtered) > 0 else 0:.0f}% of markets",
+        help="Markets where experts are divided (40-60%)"
+    )
 
 with col3:
-    total_oi = df_filtered['open_interest'].sum() if len(df_filtered) > 0 else 0
-    st.metric("Total Open Interest", f"${total_oi:,.0f}")
+    # Imminent resolutions (<7 days)
+    imminent = (df_filtered['days_left'] < 7).sum()
+    st.metric(
+        "⏰ Resolutions This Week",
+        imminent,
+        f"{imminent/len(df_filtered)*100 if len(df_filtered) > 0 else 0:.0f}% of markets",
+        help="Markets with <7 days to resolution"
+    )
 
 with col4:
-    active_count = int(df_filtered['active'].sum()) if len(df_filtered) > 0 else 0
-    st.metric("Active Markets", active_count)
+    # High liquidity markets
+    high_liquidity_threshold = df_filtered['open_interest'].quantile(0.75)
+    high_liq = (df_filtered['open_interest'] > high_liquidity_threshold).sum()
+    st.metric(
+        "💰 Highly Liquid",
+        high_liq,
+        f"Top 25% OI",
+        help="Markets with best price discovery"
+    )
 
 st.divider()
 
 # ============================================================================
-# SEARCH
+# STRATEGIC DISCOVERY SECTION
 # ============================================================================
 
+st.subheader("✨ Key Markets to Monitor")
+
+col_hot, col_disagree, col_critical = st.columns(3)
+
+with col_hot:
+    st.markdown("### 🔥 Strongest Consensus")
+    st.caption("Where the smart money agrees (>80% or <20% probability)")
+    
+    extreme = df_filtered[
+        (df_filtered['probability'] > 80) | 
+        (df_filtered['probability'] < 20)
+    ].nlargest(3, 'open_interest')
+    
+    for _, market in extreme.iterrows():
+        prob = market['probability']
+        verdict = "📈 HIGHLY LIKELY" if prob > 80 else "📉 HIGHLY UNLIKELY"
+        st.write(f"**{market['question'][:45]}...**")
+        st.caption(f"{verdict} | {prob:.0f}% confidence | Capital: ${market['open_interest']:,.0f}")
+
+with col_disagree:
+    st.markdown("### ⚖️ Markets in Flux")
+    st.caption("High disagreement = high risk/reward opportunities")
+    
+    df_filtered['distance_from_50'] = abs(df_filtered['probability'] - 50)
+    balanced = df_filtered.nsmallest(3, 'distance_from_50')
+    
+    for _, market in balanced.iterrows():
+        prob = market['probability']
+        st.write(f"**{market['question'][:45]}...**")
+        st.caption(f"Split: {prob:.0f}%/{100-prob:.0f}% | Capital: ${market['open_interest']:,.0f}")
+
+with col_critical:
+    st.markdown("### 🚨 Resolution Imminent")
+    st.caption("Markets resolving soon - Final verdicts emerging")
+    
+    soon = df_filtered[df_filtered['days_left'] < 7].nlargest(3, 'open_interest')
+    
+    for _, market in soon.iterrows():
+        days = market['days_left']
+        prob = market['probability']
+        st.write(f"**{market['question'][:45]}...**")
+        st.caption(f"{prob:.0f}% likely | ⏰ {days:.0f} days | Capital: ${market['open_interest']:,.0f}")
+
+st.divider()
+
+# ============================================================================
+# SEARCH & DETAILED EXPLORATION
+# ============================================================================
+
+st.subheader("🔍 Find Specific Markets")
+
 search_term = st.text_input(
-    "🔍 Search markets by keyword",
-    placeholder="e.g., Bitcoin, election, inflation..."
+    "Search by keyword",
+    placeholder="e.g., Bitcoin, Fed, election, earnings...",
+    help="Search across all market questions"
 )
 
 if search_term:
     df_filtered = df_filtered[
         df_filtered['question'].str.contains(search_term, case=False, na=False)
     ]
+    st.caption(f"✅ Found {len(df_filtered)} matching markets")
 
 st.divider()
 
 # ============================================================================
-# VISUALIZATIONS
+# DETAILED MARKET ANALYSIS
 # ============================================================================
 
-st.subheader("Market Analysis")
-
-if len(df_filtered) > 0:
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        fig_histogram = px.histogram(
-            df_filtered,
-            x="open_interest",
-            nbins=20,
-            title="Open Interest Distribution",
-            labels={"open_interest": "Open Interest ($)"}
-        )
-        st.plotly_chart(fig_histogram, use_container_width=True)
-    
-    with col2:
-        fig_scatter = px.scatter(
-            df_filtered,
-            x="open_interest",
-            y="volume",
-            hover_data=["question"],
-            title="Volume vs Open Interest",
-            labels={
-                "open_interest": "Open Interest ($)",
-                "volume": "Volume ($)"
-            }
-        )
-        st.plotly_chart(fig_scatter, use_container_width=True)
-
-st.divider()
-
-# ============================================================================
-# MARKET LIST
-# ============================================================================
-
-st.subheader(f"Markets ({len(df_filtered)} found)")
+st.subheader(f"📊 Market Details ({len(df_filtered)} markets)")
 
 if len(df_filtered) == 0:
-    st.info("No markets match your filters. Try adjusting the open interest threshold.")
+    st.info("💡 No markets match your filters. Try adjusting the thresholds above.")
 else:
+    # Market cards with business focus
     for idx, row in df_filtered.iterrows():
         prices = parse_json_field(row['outcome_prices'])
         outcomes = parse_json_field(row['outcomes'])
         
-        # Market expander
-        with st.expander(f"{row['question'][:70]}... | {row['probability']:.1f}%"):
-            col1, col2, col3 = st.columns(3)
+        with st.container(border=True):
+            # Header with full question and probability badge
+            col_q, col_p = st.columns([4, 1])
             
-            with col1:
-                st.write(f"**Market ID:**\n`{row['id']}`")
-                st.write(f"**Condition ID:**\n`{row['condition_id']}`")
+            with col_q:
+                st.markdown(f"### {row['question']}")
             
-            with col2:
-                st.write(f"**Open Interest:**\n${row['open_interest']:,.0f}")
-                st.write(f"**Volume:**\n${row['volume']:,.0f}")
+            with col_p:
+                prob = row['probability']
+                st.metric("Probability", f"{prob:.0f}%", 
+                         help="Market consensus (0-100%)", label_visibility="visible")
             
-            with col3:
-                status = "🟢 Active" if row['active'] else "🔴 Inactive"
-                end_date = row['end_date'].strftime('%Y-%m-%d') if pd.notna(row['end_date']) else 'N/A'
-                st.write(f"**Status:** {status}")
-                st.write(f"**End Date:** {end_date}")
+            st.divider()
             
-            # Outcome probabilities table
+            # Key metrics for business decisions
+            m1, m2, m3, m4 = st.columns(4)
+            
+            with m1:
+                st.metric("Open Interest", f"${row['open_interest']:,.0f}", 
+                         help="Total capital at risk. Higher = more confidence, better price discovery")
+            
+            with m2:
+                st.metric("24h Volume", f"${row['volume']:,.0f}",
+                         help="Trading activity. Higher = more liquid, easier to enter/exit positions")
+            
+            with m3:
+                days = (row['end_date'] - datetime.now(timezone.utc)).days
+                st.metric("Resolution", f"{days}d",
+                         help="Time until certainty. Shorter = near-final verdict, longer = still speculative")
+            
+            with m4:
+                status = "🟢 ACTIVE" if row['active'] else "🔴 CLOSED"
+                st.metric("Status", status, label_visibility="collapsed")
+            
+            st.divider()
+            
+            # Prediction bar - clear yes/no indicator
+            prob_val = row['probability']
+            prob_color = "🟢" if prob_val > 50 else "🔴"
+            st.progress(prob_val / 100.0, f"{prob_color} {prob_val:.0f}% YES likelihood")
+            
+            st.divider()
+            
+            # Outcome probabilities as business decision points
             if outcomes and prices:
-                st.divider()
-                outcome_df = pd.DataFrame({
-                    'Outcome': outcomes,
-                    'Price': prices,
-                    'Probability (%)': [p * 100 for p in prices]
-                })
-                st.dataframe(outcome_df, use_container_width=True, hide_index=True)
+                st.write("**Outcome Probabilities:**")
+                
+                for outcome, price in zip(outcomes, prices):
+                    prob_pct = float(price) * 100
+                    col_label, col_bar = st.columns([1, 4])
+                    
+                    with col_label:
+                        st.write(f"**{outcome}**")
+                    
+                    with col_bar:
+                        st.progress(float(price), f"{prob_pct:.1f}%")
 
 st.divider()
-st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Total markets in database: {len(df)}")
+
+# Enhanced footer with meaningful stats and refresh status
+f1, f2, f3, f4 = st.columns(4)
+with f1:
+    st.metric("Total Markets", len(df), delta=None, label_visibility="collapsed")
+with f2:
+    liquid_count = len(df[df['open_interest'] > 50000])
+    st.metric("Highly Liquid", liquid_count, label_visibility="collapsed")
+with f3:
+    high_conviction = len(df[(df['probability'] > 80) | (df['probability'] < 20)])
+    st.metric("High Conviction", high_conviction, label_visibility="collapsed")
+with f4:
+    refresh_status, _ = get_refresh_status()
+    st.caption(refresh_status)
+
