@@ -70,7 +70,6 @@ def load_markets():
     """
     df = pd.read_sql_query(query, conn)
     df['end_date'] = pd.to_datetime(df['end_date'], format='ISO8601', utc=True)
-    df['end_date'] = pd.to_datetime(df['end_date'], format='ISO8601', utc=True)
     conn.close()
     return df
 
