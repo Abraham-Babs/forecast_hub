@@ -9,8 +9,10 @@ import json
 import sqlite3
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
+from functools import wraps
 from dotenv import load_dotenv
 import aiohttp
 
@@ -266,18 +268,51 @@ class PolymarketPoller:
             return filtered
 
 
+def retry_on_db_lock(max_retries: int = 3, initial_delay: float = 0.1):
+    """Decorator to retry database operations on lock with exponential backoff."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except sqlite3.OperationalError as e:
+                    if "database is locked" in str(e):
+                        last_error = e
+                        if attempt < max_retries - 1:
+                            logger.warning(f"[DB LOCK] Attempt {attempt + 1}/{max_retries}: retrying in {delay:.2f}s")
+                            time.sleep(delay)
+                            delay *= 2  # Exponential backoff
+                        continue
+                    raise
+                except Exception:
+                    raise
+            # If all retries exhausted, raise last error
+            logger.error(f"[DB LOCK] Failed after {max_retries} attempts: {last_error}")
+            raise last_error
+        return wrapper
+    return decorator
+
+
 class DatabaseManager:
-    """SQLite database operations."""
+    """SQLite database operations with concurrency handling."""
     
     def __init__(self, db_path: str | None = None):
         self.db_path = db_path or DATABASE_PATH
         self.conn = None
     
     def connect(self):
-        """Connect to database."""
-        self.conn = sqlite3.connect(self.db_path)
+        """Connect to database with concurrency handling."""
+        # Set timeout to 10 seconds for concurrent access
+        self.conn = sqlite3.connect(self.db_path, timeout=10.0, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        logger.info(f"Connected to SQLite database: {self.db_path}")
+        # Enable WAL mode for better concurrent read/write performance
+        self.conn.execute('PRAGMA journal_mode=WAL')
+        # Increase cache size for better performance
+        self.conn.execute('PRAGMA cache_size=-64000')
+        logger.info(f"Connected to SQLite database (WAL mode, 10s timeout): {self.db_path}")
     
     def init_schema(self):
         """Create tables if they don't exist."""
@@ -350,8 +385,9 @@ class DatabaseManager:
         self.conn.commit()
         logger.info("Database schema initialized")
     
+    @retry_on_db_lock(max_retries=3, initial_delay=0.1)
     def insert_markets(self, markets: list) -> tuple:
-        """UPSERT markets and snapshots. Returns (new_count, updated_count)."""
+        """UPSERT markets and snapshots. Returns (new_count, updated_count). Retries on DB lock."""
         cursor = self.conn.cursor()
         
         # Get source ID
@@ -422,8 +458,9 @@ class DatabaseManager:
         if self.conn:
             self.conn.close()
     
+    @retry_on_db_lock(max_retries=3, initial_delay=0.1)
     def load_cached_markets(self) -> list | None:
-        """Load all markets from cache (for API failure fallback)."""
+        """Load all markets from cache (for API failure fallback). Retries on DB lock."""
         try:
             cursor = self.conn.cursor()
             cursor.execute("""

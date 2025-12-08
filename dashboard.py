@@ -13,6 +13,8 @@ import streamlit as st
 from datetime import datetime, timezone
 import json
 import logging
+import time
+from functools import wraps
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -31,6 +33,16 @@ if not os.path.exists(DATABASE_PATH):
         os.chdir(os.path.dirname(__file__) or ".")
 
 # ============================================================================
+# PAGINATION CONFIGURATION
+# ============================================================================
+
+PAGINATION_SIZE = 20  # Show 20 markets per page
+
+# Initialize pagination state
+if "markets_to_show" not in st.session_state:
+    st.session_state.markets_to_show = PAGINATION_SIZE
+
+# ============================================================================
 # PAGE CONFIGURATION
 # ============================================================================
 
@@ -45,20 +57,46 @@ st.set_page_config(
 # HELPER FUNCTIONS
 # ============================================================================
 
+def retry_on_db_lock(max_retries: int = 3, initial_delay: float = 0.1):
+    """Decorator to retry database operations on lock with exponential backoff."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except sqlite3.OperationalError as e:
+                    if "database is locked" in str(e):
+                        if attempt < max_retries - 1:
+                            logger.debug(f"[DB LOCK] Attempt {attempt + 1}/{max_retries}: retrying in {delay:.2f}s")
+                            time.sleep(delay)
+                            delay *= 2
+                        continue
+                    raise
+            raise sqlite3.OperationalError(f"Database locked after {max_retries} retries")
+        return wrapper
+    return decorator
+
 @st.cache_resource
 def get_db_connection():
-    """Create database connection (cached for reuse)."""
+    """Create database connection with concurrency handling (cached for reuse)."""
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        # Use 10-second timeout and WAL mode for better concurrency
+        conn = sqlite3.connect(DATABASE_PATH, timeout=10.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA cache_size=-64000')
+        logger.info("Database connection established (WAL mode, 10s timeout)")
         return conn
     except sqlite3.Error as e:
         logger.error(f"Database connection failed: {e}")
         st.error(f"Failed to connect to database: {e}")
         st.stop()
 
+@retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def get_max_open_interest():
-    """Get maximum open interest value from database."""
+    """Get maximum open interest value from database. Retries on DB lock."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -69,8 +107,9 @@ def get_max_open_interest():
         logger.error(f"Failed to fetch max OI: {e}")
         return 500_000_000
 
+@retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def get_last_refresh_time():
-    """Get last data refresh timestamp from metadata table."""
+    """Get last data refresh timestamp from metadata table. Retries on DB lock."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -421,8 +460,18 @@ st.subheader(f"📊 Market Details ({len(df_filtered)} markets)")
 if len(df_filtered) == 0:
     st.info("💡 No markets match your filters. Try adjusting the thresholds above.")
 else:
+    # Display count and pagination info
+    remaining = len(df_filtered) - st.session_state.markets_to_show
+    if remaining > 0:
+        st.caption(f"📍 Showing {min(st.session_state.markets_to_show, len(df_filtered))} of {len(df_filtered)} markets (+ {remaining} more)")
+    else:
+        st.caption(f"✅ Showing all {len(df_filtered)} markets")
+    
     # Market cards with business focus
-    for idx, row in df_filtered.iterrows():
+    for idx, (_, row) in enumerate(df_filtered.iterrows()):
+        # Stop rendering after pagination limit
+        if idx >= st.session_state.markets_to_show:
+            break
         prices = parse_json_field(row['outcome_prices'])
         outcomes = parse_json_field(row['outcomes'])
         
@@ -482,6 +531,17 @@ else:
                     
                     with col_bar:
                         st.progress(float(price), f"{prob_pct:.1f}%")
+    
+    # Load More button
+    st.divider()
+    if st.session_state.markets_to_show < len(df_filtered):
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            if st.button("📥 Load More Markets", use_container_width=True, key="load_more"):
+                st.session_state.markets_to_show += PAGINATION_SIZE
+                st.rerun()
+    else:
+        st.caption("✅ All markets loaded")
 
 st.divider()
 
