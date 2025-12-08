@@ -50,7 +50,7 @@ st.set_page_config(
     page_title="Polymarket Business Intelligence",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
 # ============================================================================
@@ -161,7 +161,8 @@ def load_markets():
             active,
             outcomes,
             outcome_prices,
-            probability
+            probability,
+            category
         FROM markets
         ORDER BY open_interest DESC
         """
@@ -182,6 +183,94 @@ def load_markets():
         logger.error(f"Failed to load markets: {e}")
         st.error(f"Failed to load market data: {e}")
         return pd.DataFrame()
+
+@retry_on_db_lock(max_retries=3, initial_delay=0.1)
+def load_watchlist():
+    """Load user's watchlist from database."""
+    try:
+        conn = get_db_connection()
+        query = """
+        SELECT m.id FROM markets m
+        INNER JOIN watchlist w ON m.id = w.market_id
+        """
+        df = pd.read_sql_query(query, conn)
+        return set(df['id'].tolist()) if len(df) > 0 else set()
+    except sqlite3.Error as e:
+        logger.debug(f"Failed to load watchlist: {e}")
+        return set()
+
+@retry_on_db_lock(max_retries=3, initial_delay=0.1)
+def add_to_watchlist(market_id: str):
+    """Add market to watchlist."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO watchlist (market_id) VALUES (?)", (market_id,))
+        conn.commit()
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"Failed to add to watchlist: {e}")
+        return False
+
+@retry_on_db_lock(max_retries=3, initial_delay=0.1)
+def remove_from_watchlist(market_id: str):
+    """Remove market from watchlist."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM watchlist WHERE market_id = ?", (market_id,))
+        conn.commit()
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"Failed to remove from watchlist: {e}")
+        return False
+
+@retry_on_db_lock(max_retries=3, initial_delay=0.1)
+def get_probability_history(market_id: str):
+    """Get historical probability data for a market."""
+    try:
+        conn = get_db_connection()
+        query = """
+        SELECT timestamp, probability FROM snapshots
+        WHERE market_id = ?
+        ORDER BY timestamp ASC
+        """
+        df = pd.read_sql_query(query, conn, params=(market_id,))
+        if len(df) > 0:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+        return df
+    except sqlite3.Error as e:
+        logger.debug(f"Failed to load probability history: {e}")
+        return pd.DataFrame()
+
+@retry_on_db_lock(max_retries=3, initial_delay=0.1)
+def trigger_data_refresh():
+    """Trigger a manual data refresh by calling the pipeline."""
+    try:
+        from pipeline import DatabaseManager
+        import asyncio
+        from pipeline import PolymarketPoller
+        
+        with st.spinner("🔄 Refreshing data from API..."):
+            # Run async pipeline
+            min_volume = float(os.getenv("MIN_VOLUME_USD", "100000"))
+            min_oi = float(os.getenv("MIN_OPEN_INTEREST_USD", "50000"))
+            
+            markets = asyncio.run(PolymarketPoller.fetch_all_categories(min_volume, min_oi))
+            
+            # Store in database
+            db = DatabaseManager()
+            db.connect()
+            db.init_schema()
+            new, updated = db.insert_markets(markets)
+            db.close()
+            
+            st.success(f"✅ Refresh complete! {new} new markets, {updated} updated")
+            st.rerun()
+    except Exception as e:
+        st.error(f"❌ Refresh failed: {e}")
+        logger.error(f"Manual refresh error: {e}", exc_info=True)
+
 
 def parse_json_field(json_str):
     """Parse JSON string safely."""
@@ -221,6 +310,19 @@ open_interest_step = max(1000, max_open_interest // 100)
 with st.sidebar:
     st.header("🎚️ Filters")
     
+    st.divider()
+    
+    # Category/tag filtering
+    available_categories = sorted(df['category'].dropna().unique().tolist()) if 'category' in df.columns and len(df) > 0 else []
+    selected_categories = st.multiselect(
+        "Market Categories",
+        available_categories if available_categories else ["No categories found"],
+        default=[],
+        help="Filter to specific prediction market categories. Leave empty to see all markets."
+    )
+    
+    st.divider()
+    
     # Open Interest threshold slider
     min_open_interest = st.slider(
         "Minimum Open Interest ($)",
@@ -253,6 +355,7 @@ with st.sidebar:
         "When do you want markets to resolve?",
         ["Today (0-1 days)", "This Week (2-7 days)", "Next 30 Days (8-30 days)", "All Markets"],
         horizontal=True,
+        index=3,
         help="Markets resolving sooner are more informative; longer-dated markets are more speculative"
     )
     
@@ -300,12 +403,29 @@ with st.sidebar:
 st.title("📈 Business Prediction Market Intelligence")
 st.markdown("**Real-time consensus analysis for strategic decision-making**")
 
+# Display last refresh timestamp and manual refresh button
+col_refresh, col_status = st.columns([2, 3])
+
+with col_refresh:
+    if st.button("🔄 Refresh Data Now", use_container_width=True, help="Manually fetch latest data from Polymarket API"):
+        trigger_data_refresh()
+
+with col_status:
+    refresh_status, status_color = get_refresh_status()
+    st.markdown(f"**{refresh_status}**")
+
+st.divider()
+
 # Apply filters
 df_filtered = df[
     (df['open_interest'] >= min_open_interest) &
     (df['probability'] >= prob_min) &
     (df['probability'] <= prob_max)
 ].copy()
+
+# Apply category filter if selected
+if selected_categories and 'category' in df_filtered.columns:
+    df_filtered = df_filtered[df_filtered['category'].isin(selected_categories)]
 
 # Calculate days left for time filtering
 df_filtered['days_left'] = (df_filtered['end_date'] - datetime.now(timezone.utc)).dt.days
@@ -324,6 +444,9 @@ def get_maturity(days):
         return "🔵 SPECULATIVE"
 
 df_filtered['maturity'] = df_filtered['days_left'].apply(get_maturity)
+
+# Load user's watchlist
+user_watchlist = load_watchlist()
 
 # ============================================================================
 # BUSINESS INSIGHTS SECTION
@@ -437,17 +560,49 @@ st.divider()
 
 st.subheader("🔍 Find Specific Markets")
 
+# Search box
 search_term = st.text_input(
     "Search by keyword",
     placeholder="e.g., Bitcoin, Fed, election, earnings...",
     help="Search across all market questions"
 )
 
+# Search results with sorting
+search_results = df_filtered.copy()
 if search_term:
-    df_filtered = df_filtered[
-        df_filtered['question'].str.contains(search_term, case=False, na=False)
+    search_results = search_results[
+        search_results['question'].str.contains(search_term, case=False, na=False)
     ]
-    st.caption(f"✅ Found {len(df_filtered)} matching markets")
+
+if search_term and len(search_results) > 0:
+    # Display result count
+    st.caption(f"📍 Found {len(search_results)} matching markets")
+    
+    # Sorting options
+    col_sort1, col_sort2 = st.columns(2)
+    with col_sort1:
+        sort_by = st.selectbox(
+            "Sort by",
+            ["Conviction (Highest %)", "Liquidity (Highest OI)", "Resolution Time (Soonest)", "Activity (24h Volume)"],
+            key="search_sort"
+        )
+    
+    # Apply sorting
+    if sort_by == "Conviction (Highest %)":
+        search_results = search_results.iloc[(search_results['probability'] - 50).abs().argsort()]
+        search_results = search_results.iloc[::-1]  # Highest conviction first
+    elif sort_by == "Liquidity (Highest OI)":
+        search_results = search_results.sort_values('open_interest', ascending=False)
+    elif sort_by == "Resolution Time (Soonest)":
+        search_results = search_results.sort_values('end_date', ascending=True)
+    elif sort_by == "Activity (24h Volume)":
+        search_results = search_results.sort_values('volume', ascending=False)
+    
+    # Update filtered dataframe to show sorted search results
+    df_filtered = search_results
+else:
+    if search_term:
+        st.info("💡 No markets match your search. Try different keywords: crypto, Fed, politics, earnings, etc.")
 
 st.divider()
 
@@ -475,9 +630,33 @@ else:
         prices = parse_json_field(row['outcome_prices'])
         outcomes = parse_json_field(row['outcomes'])
         
+        # Get category from database or infer from question
+        if pd.notna(row.get('category')):
+            category = row['category']
+        else:
+            question_lower = row['question'].lower()
+            if any(word in question_lower for word in ['bitcoin', 'ethereum', 'crypto', 'xrp', 'solana', 'doge']):
+                category = "🔐 Crypto"
+            elif any(word in question_lower for word in ['trump', 'biden', 'election', 'congress', 'senate', 'democrat', 'republican', 'president']):
+                category = "🏛️ Politics"
+            elif any(word in question_lower for word in ['fed', 'interest rate', 'inflation', 'recession', 'gdp', 'unemployment', 'economy', 'stock', 'dow', 'nasdaq', 's&p']):
+                category = "📈 Finance"
+            elif any(word in question_lower for word in ['ai', 'llm', 'openai', 'google', 'meta', 'apple', 'microsoft', 'tech', 'software']):
+                category = "💻 Tech"
+            elif any(word in question_lower for word in ['war', 'conflict', 'russia', 'ukraine', 'israel', 'international']):
+                category = "🌍 Geopolitics"
+            else:
+                category = "📊 Other"
+        
+        # Check if in watchlist
+        in_watchlist = row['id'] in user_watchlist
+        
         with st.container(border=True):
-            # Header with full question and probability badge
-            col_q, col_p = st.columns([4, 1])
+            # Header with category badge, question, and probability + watchlist button
+            col_cat, col_q, col_p, col_watch = st.columns([1, 3, 1.2, 0.8])
+            
+            with col_cat:
+                st.caption(category)
             
             with col_q:
                 st.markdown(f"### {row['question']}")
@@ -486,6 +665,19 @@ else:
                 prob = row['probability']
                 st.metric("Probability", f"{prob:.0f}%", 
                          help="Market consensus (0-100%)", label_visibility="visible")
+            
+            with col_watch:
+                # Watchlist button
+                if in_watchlist:
+                    if st.button("⭐", key=f"watch_{row['id']}", help="Remove from watchlist"):
+                        remove_from_watchlist(row['id'])
+                        st.session_state[f"watch_{row['id']}"] = False
+                        st.rerun()
+                else:
+                    if st.button("☆", key=f"watch_{row['id']}", help="Add to watchlist"):
+                        add_to_watchlist(row['id'])
+                        st.session_state[f"watch_{row['id']}"] = True
+                        st.rerun()
             
             st.divider()
             
@@ -515,6 +707,18 @@ else:
             prob_val = row['probability']
             prob_color = "🟢" if prob_val > 50 else "🔴"
             st.progress(prob_val / 100.0, f"{prob_color} {prob_val:.0f}% YES likelihood")
+            
+            st.divider()
+            
+            # Historical probability trend
+            prob_history = get_probability_history(row['id'])
+            if len(prob_history) > 1:
+                try:
+                    chart_data = prob_history.set_index('timestamp')
+                    st.line_chart(chart_data['probability'], height=200, use_container_width=True)
+                    st.caption("📈 Historical probability trend")
+                except Exception as e:
+                    logger.debug(f"Could not render chart: {e}")
             
             st.divider()
             

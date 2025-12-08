@@ -42,9 +42,9 @@ def background_scheduler():
     """Run scheduler in background thread."""
     global background_refresh_running
     
-    # Schedule refresh every 30 minutes
-    schedule.every(30).minutes.do(run_refresh)
-    logger.info("[BACKGROUND] Scheduler started - refreshing data every 30 minutes")
+    # Schedule refresh every 6 hours (markets are event-based, resolve over days/weeks)
+    schedule.every(6).hours.do(run_refresh)
+    logger.info("[BACKGROUND] Scheduler started - refreshing data every 6 hours")
     
     while background_refresh_running:
         schedule.run_pending()
@@ -76,7 +76,7 @@ def main():
         return 1
     
     # Step 2: Start background refresh thread
-    print("[2/3] Starting background data refresh (every 30 minutes)...\n")
+    print("[2/3] Starting background data refresh (every 6 hours)...\n")
     background_refresh_running = True
     refresh_thread = threading.Thread(target=background_scheduler, daemon=True)
     refresh_thread.start()
@@ -86,7 +86,7 @@ def main():
     print("[3/3] Launching dashboard...\n")
     print("="*80)
     print("Dashboard running at: http://localhost:8501")
-    print("Data refreshes automatically every 30 minutes")
+    print("Data refreshes automatically every 6 hours")
     print("Press Ctrl+C to stop")
     print("="*80 + "\n")
     

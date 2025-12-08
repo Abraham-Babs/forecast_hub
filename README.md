@@ -1,6 +1,19 @@
-# Polymarket BI
+# Polymarket BI — Business Intelligence for Prediction Markets
 
-Async data pipeline + dashboard for Polymarket prediction markets.
+**Real-time consensus analysis for strategic decision-making**
+
+Use crowd-powered forecasts from Polymarket to improve business decisions. Companies rely on prediction markets as a signal for what sophisticated predictors think will happen across economy, technology, politics, and more.
+
+## What This Tool Does
+
+Polymarket BI aggregates high-quality prediction market data and surfaces it in an actionable dashboard. Instead of manually checking Polymarket, you get:
+
+- **Filtered markets that matter**: Only shows markets with real capital at stake ($100K+ volume, $50K+ open interest) to eliminate noise and manipulation risk
+- **Data freshness transparency**: Displays when data was last updated; manual refresh button available
+- **Easy discovery**: Search, filter by category, sort by conviction/liquidity/resolution timeline
+- **Watchlist/favorites**: Save important markets for tracking across sessions
+- **Historical trends**: See how probabilities have changed over time
+- **Business insights**: Pre-calculated consensus strength, disagreement zones, and imminent resolutions
 
 ## Quick Start
 
@@ -9,45 +22,67 @@ uv sync
 python main.py
 ```
 
-This fetches market data and launches the Streamlit dashboard at `http://localhost:8501`.
+This fetches market data and launches the dashboard at `http://localhost:8501`.
+
+## Product Philosophy
+
+**Target Users**: Companies making business decisions (forecasting, risk analysis, hedging, timing)
+
+**Core Value Proposition**: Use prediction market signals to validate internal forecasts, discover blind spots, and quantify conviction across complex outcomes
+
+**Key Design Decisions**:
+
+1. **High-signal markets only** — Filters for volume + open interest ensure capital is actually at risk. Eliminates the long tail of low-liquidity, potentially manipulated markets.
+
+2. **Data quality is paramount** — Shows when data is stale, allows manual refresh, surface missing data. Companies can't make decisions on data they don't trust.
+
+3. **Category-based navigation** — 13 categories (Economy, Finance, Tech, Crypto, Politics, etc.) because prediction markets are extremely dynamic. Markets appear/disappear by category; filtering helps users find signals in their domain.
+
+4. **Multiple entry points** — Search for specific questions, filter by probability conviction/timeline, or browse curated "strongest consensus" / "high disagreement" / "resolution imminent" sections.
+
+5. **Persistent watchlists** — Saved to database so users can track specific outcomes across sessions.
+
+6. **Historical probability tracking** — Snapshots at each refresh let users see how consensus has shifted.
 
 ## How It Works
 
-- **pipeline.py** — Async fetches 13 business-relevant market categories from Polymarket API and OI API, validates (volume, OI, outcomes), stores in SQLite
-- **dashboard.py** — Streamlit visualization with metrics, charts, market search, and filtering
-- **main.py** — Single entry point that runs both pipeline and dashboard
+- **pipeline.py** — Async fetches 13 market categories from Polymarket API + Open Interest API, validates data quality, stores in SQLite with snapshots for trend tracking
+- **dashboard.py** — Streamlit interface for search, discovery, filtering, and decision-making
+- **main.py** — Single entry point; runs pipeline, then launches dashboard with automatic background refreshes every 6 hours
 
 ## Setup
 
 ```bash
-uv sync              # Install dependencies (one-time)
-python main.py       # Fetch data, then launch dashboard
+uv sync                 # Install dependencies (one-time)
+python main.py          # Full pipeline + dashboard
+```
+
+### Dashboard Only (using existing data)
+
+```bash
+streamlit run dashboard.py
+```
+
+### Pipeline Only (no dashboard)
+
+```bash
+python pipeline.py
 ```
 
 ## Data Sources
 
-- **Markets API:** `https://gamma-api.polymarket.com/markets`
-- **Open Interest API:** `https://data-api.polymarket.com/oi`
+- **Markets API:** `https://gamma-api.polymarket.com/markets` (13 categories, 300 markets/category limit)
+- **Open Interest API:** `https://data-api.polymarket.com/oi` (per-market capital at risk)
 
-Markets are fetched from 13 business-relevant categories and filtered by:
-- Volume ≥ $100,000 (configurable, default)
-- Open Interest ≥ $50,000 (configurable, default)
-- Valid outcome prices (0-1 range)
-- Condition ID present
+## Filtering Criteria
 
-Database: SQLite (`polymarket_bi.db`)
+Markets are included if they meet **all** of:
+- Volume ≥ $100,000 USD (proves real trading activity)
+- Open Interest ≥ $50,000 USD (proves capital commitment; eliminates manipulation risk)
+- Valid outcome prices (0.0-1.0 range)
+- Condition ID present (unique market identifier)
 
-## Categories
-
-The pipeline fetches from these 13 market categories:
-
-1. **Business** — General business news and corporate events
-2. **Business News** — Breaking business developments
-3. **Crypto** — Cryptocurrency and blockchain predictions
-4. **Politics** — Political elections and policy outcomes
-5. **Tech** — Technology industry developments
-6. **Finance** — Financial markets and institutions
-7. **Economy** — Macroeconomic indicators and trends
+**Rationale**: These thresholds ensure you're seeing markets where sophisticated participants have real money at stake. Prevents low-liquidity, potentially manipulated markets from polluting your decision signals.
 8. **Stocks** — Individual stock and equity predictions
 9. **Market Cap** — Market capitalization movements
 10. **Banking** — Banking sector developments

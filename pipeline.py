@@ -207,6 +207,7 @@ class PolymarketPoller:
                     for m in markets:
                         norm = DataNormalizer.normalize(m, min_volume)
                         if norm:
+                            norm['category'] = category  # Add category tracking
                             normalized.append(norm)
                     logger.info(f"{category} (tag_id={tag_id}): fetched {len(normalized)} valid markets")
                     return normalized
@@ -347,8 +348,19 @@ class DatabaseManager:
                 outcomes TEXT,
                 outcome_prices TEXT NOT NULL,
                 probability REAL,
+                category TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(source_id) REFERENCES sources(id)
+            )
+        """)
+        
+        # Watchlist table (user favorites)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS watchlist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT UNIQUE NOT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(market_id) REFERENCES markets(id) ON DELETE CASCADE
             )
         """)
         
@@ -360,6 +372,7 @@ class DatabaseManager:
                 question TEXT,
                 outcome_prices TEXT,
                 volume REAL,
+                probability REAL,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(market_id) REFERENCES markets(id)
             )
@@ -373,6 +386,19 @@ class DatabaseManager:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        # Add missing columns to existing tables (schema migration)
+        try:
+            cursor.execute("ALTER TABLE markets ADD COLUMN category TEXT")
+            logger.info("Added 'category' column to markets table")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        
+        try:
+            cursor.execute("ALTER TABLE snapshots ADD COLUMN probability REAL")
+            logger.info("Added 'probability' column to snapshots table")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         
         # Insert Polymarket source
         cursor.execute("""
@@ -407,15 +433,16 @@ class DatabaseManager:
             exists = cursor.fetchone() is not None
             
             cursor.execute("""
-                INSERT INTO markets (id, source_id, question, condition_id, liquidity, volume, open_interest, end_date, active, outcomes, outcome_prices, probability)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO markets (id, source_id, question, condition_id, liquidity, volume, open_interest, end_date, active, outcomes, outcome_prices, probability, category)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     liquidity = excluded.liquidity,
                     volume = excluded.volume,
                     open_interest = excluded.open_interest,
                     outcomes = excluded.outcomes,
                     outcome_prices = excluded.outcome_prices,
-                    probability = excluded.probability
+                    probability = excluded.probability,
+                    category = excluded.category
             """, (
                 market['id'],
                 source_id,
@@ -429,6 +456,7 @@ class DatabaseManager:
                 market['outcomes'],
                 market['outcome_prices'],
                 market['probability'],
+                market.get('category'),
             ))
             
             if exists:
@@ -438,13 +466,14 @@ class DatabaseManager:
             
             # Insert snapshot
             cursor.execute("""
-                INSERT INTO snapshots (market_id, question, outcome_prices, volume)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO snapshots (market_id, question, outcome_prices, volume, probability)
+                VALUES (?, ?, ?, ?, ?)
             """, (
                 market['id'],
                 market['question'],
                 market['outcome_prices'],
                 market['volume'],
+                market['probability'],
             ))
         
         # Record last refresh timestamp
@@ -456,6 +485,70 @@ class DatabaseManager:
         self.conn.commit()
         logger.info(f"Recorded refresh timestamp: {new_count} new, {updated_count} updated")
         return new_count, updated_count
+    
+    @retry_on_db_lock(max_retries=3, initial_delay=0.1)
+    @retry_on_db_lock(max_retries=3, initial_delay=0.1)
+    def add_to_watchlist(self, market_id: str) -> bool:
+        """Add market to watchlist. Returns True if successful, False if already exists."""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT INTO watchlist (market_id)
+                VALUES (?)
+            """, (market_id,))
+            self.conn.commit()
+            logger.info(f"Added market {market_id} to watchlist")
+            return True
+        except sqlite3.IntegrityError:
+            logger.debug(f"Market {market_id} already in watchlist")
+            return False
+        except sqlite3.Error as e:
+            logger.error(f"Failed to add to watchlist: {e}")
+            return False
+    
+    @retry_on_db_lock(max_retries=3, initial_delay=0.1)
+    def remove_from_watchlist(self, market_id: str) -> bool:
+        """Remove market from watchlist. Returns True if successful."""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM watchlist WHERE market_id = ?", (market_id,))
+            self.conn.commit()
+            logger.info(f"Removed market {market_id} from watchlist")
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Failed to remove from watchlist: {e}")
+            return False
+    
+    @retry_on_db_lock(max_retries=3, initial_delay=0.1)
+    def get_watchlist(self) -> list:
+        """Get all markets in watchlist."""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT m.id, m.question, m.condition_id, m.liquidity, m.volume, 
+                       m.open_interest, m.end_date, m.active, m.outcomes, m.outcome_prices, 
+                       m.probability, m.category
+                FROM markets m
+                INNER JOIN watchlist w ON m.id = w.market_id
+                ORDER BY w.added_at DESC
+            """)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows] if rows else []
+        except sqlite3.Error as e:
+            logger.error(f"Failed to get watchlist: {e}")
+            return []
+    
+    @retry_on_db_lock(max_retries=3, initial_delay=0.1)
+    def get_last_refresh(self) -> str | None:
+        """Get the last refresh timestamp from metadata."""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT value FROM metadata WHERE key = 'last_refresh'")
+            row = cursor.fetchone()
+            return row[0] if row else None
+        except sqlite3.Error as e:
+            logger.error(f"Failed to get last refresh: {e}")
+            return None
     
     def close(self):
         """Close database connection."""
@@ -469,7 +562,7 @@ class DatabaseManager:
             cursor = self.conn.cursor()
             cursor.execute("""
                 SELECT id, source_id, question, condition_id, liquidity, volume, 
-                       open_interest, end_date, active, outcomes, outcome_prices, probability
+                       open_interest, end_date, active, outcomes, outcome_prices, probability, category
                 FROM markets
                 ORDER BY open_interest DESC
             """)
