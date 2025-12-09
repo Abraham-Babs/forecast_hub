@@ -51,3 +51,4 @@ polymarket_bi.db
 
 # uv lock file (optional - can be committed)
 # uv.lock
+.github
