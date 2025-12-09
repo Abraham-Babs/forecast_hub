@@ -96,6 +96,38 @@ class DataNormalizer:
             return False
     
     @staticmethod
+    def validate_outcomes_and_prices_match(outcomes: Any, outcome_prices: Any) -> bool:
+        """Ensure outcomes and outcome_prices arrays have matching lengths."""
+        try:
+            # Parse outcomes
+            if isinstance(outcomes, str):
+                outcomes_list = json.loads(outcomes) if outcomes else []
+            else:
+                outcomes_list = outcomes if outcomes else []
+            
+            # Parse prices
+            if isinstance(outcome_prices, str):
+                prices_list = json.loads(outcome_prices) if outcome_prices else []
+            else:
+                prices_list = outcome_prices if outcome_prices else []
+            
+            # Both must be non-empty and equal length
+            if not outcomes_list or not prices_list:
+                return False
+            
+            if len(outcomes_list) != len(prices_list):
+                logger.debug(
+                    f"Outcomes/prices mismatch: {len(outcomes_list)} outcomes vs "
+                    f"{len(prices_list)} prices"
+                )
+                return False
+            
+            return True
+        except Exception as e:
+            logger.debug(f"Error validating outcomes/prices match: {e}")
+            return False
+    
+    @staticmethod
     def validate_open_interest(oi: float, min_oi: float = 50000) -> bool:
         """Ensure minimum open interest threshold."""
         try:
@@ -125,6 +157,11 @@ class DataNormalizer:
         if not condition_id:
             return None
         
+        # Validate that outcomes and prices match in length
+        if not DataNormalizer.validate_outcomes_and_prices_match(outcomes, outcome_prices):
+            logger.debug(f"Market {market.get('id')}: outcomes/prices mismatch")
+            return None
+        
         # Ensure outcome_prices is stored as JSON string
         if isinstance(outcome_prices, list):
             outcome_prices_list = outcome_prices
@@ -144,14 +181,27 @@ class DataNormalizer:
         # Calculate probability as "Yes" outcome price in percent
         # The outcomes array is positionally mapped to outcome_prices
         # e.g., ["Yes", "No"] with [0.25, 0.75] means Yes=25%, No=75%
-        probability = 0.0
+        probability = None
         if outcomes_list and outcome_prices_list:
             try:
                 yes_index = outcomes_list.index("Yes")
                 probability = float(outcome_prices_list[yes_index]) * 100
             except (ValueError, IndexError):
-                # If "Yes" not found, default to 0
-                probability = 0.0
+                # If "Yes" not found, use first outcome (for non-binary markets)
+                # or reject the market as invalid during database insert
+                logger.debug(
+                    f"Market {market.get('id')}: 'Yes' outcome not found in {outcomes_list}. "
+                    f"Using first outcome price instead."
+                )
+                try:
+                    probability = float(outcome_prices_list[0]) * 100
+                except (ValueError, IndexError, TypeError):
+                    # Completely invalid; will be caught during validation
+                    probability = None
+        
+        # If probability is None, the market lacks valid outcome data
+        if probability is None:
+            return None
         
         return {
             'id': market.get('id'),
@@ -256,19 +306,44 @@ class PolymarketPoller:
             
             # Step 3: Attach OI and filter by threshold (explicit indexing to avoid mismatch)
             filtered = []
+            skipped_count = 0
+            failed_oi_count = 0
+            
             for market, oi_result in zip(markets_with_oi, oi_values):
                 if isinstance(oi_result, Exception):
-                    logger.warning(f"Failed to fetch OI for market {market.get('id')}: {oi_result}")
+                    failed_oi_count += 1
+                    logger.debug(f"Failed to fetch OI for market {market.get('id')}: {oi_result}")
                     continue
                 
                 oi = oi_result
                 if oi is not None and DataNormalizer.validate_open_interest(oi, min_oi):
                     market['open_interest'] = oi
                     filtered.append(market)
+                else:
+                    skipped_count += 1
+                    logger.debug(f"Market {market.get('id')} skipped: OI ${oi} below threshold ${min_oi}")
+            
+            # Log summary of OI filtering results
+            if failed_oi_count > 0:
+                logger.warning(
+                    f"[OI FETCH] {failed_oi_count} markets had OI fetch failures "
+                    f"(will retry on next refresh)"
+                )
+            if skipped_count > 0:
+                logger.info(
+                    f"[OI FILTER] {skipped_count} markets filtered out (OI < ${min_oi:,.0f})"
+                )
             
             # Add markets without OI (may not have OI data available)
             markets_without_oi = [m for m in all_markets if not m.get('condition_id')]
+            if markets_without_oi:
+                logger.info(f"[NO CONDITION_ID] {len(markets_without_oi)} markets have no condition_id (OI unavailable)")
             filtered.extend(markets_without_oi)
+            
+            logger.info(
+                f"[FINAL RESULTS] {len(filtered)} markets pass all filters "
+                f"(from {len(all_markets)} fetched)"
+            )
             
             return filtered
 

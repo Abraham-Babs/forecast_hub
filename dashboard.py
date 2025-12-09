@@ -16,6 +16,7 @@ import logging
 import time
 from functools import wraps
 from dotenv import load_dotenv
+from tz_utils import now_utc, days_until, format_relative_time
 
 # Load environment variables
 load_dotenv()
@@ -128,9 +129,9 @@ def get_refresh_status():
         return "⚠️ Never refreshed", "red"
     
     try:
-        last_dt = pd.to_datetime(last_refresh, utc=True)
-        now_dt = datetime.now(timezone.utc)
-        delta = now_dt - last_dt
+        last_dt = pd.to_datetime(last_refresh, utc=True).to_pydatetime()
+        current_dt = now_utc()
+        delta = current_dt - last_dt
         
         minutes_ago = int(delta.total_seconds() / 60)
         if minutes_ago < 1:
@@ -246,30 +247,58 @@ def get_probability_history(market_id: str):
 @retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def trigger_data_refresh():
     """Trigger a manual data refresh by calling the pipeline."""
+    # Debouncing: prevent multiple simultaneous refreshes
+    if "refresh_in_progress" not in st.session_state:
+        st.session_state.refresh_in_progress = False
+    
+    if st.session_state.refresh_in_progress:
+        st.warning("⏳ Refresh already in progress. Please wait...")
+        return
+    
     try:
+        st.session_state.refresh_in_progress = True
+        
         from pipeline import DatabaseManager
         import asyncio
         from pipeline import PolymarketPoller
         
-        with st.spinner("🔄 Refreshing data from API..."):
-            # Run async pipeline
-            min_volume = float(os.getenv("MIN_VOLUME_USD", "100000"))
-            min_oi = float(os.getenv("MIN_OPEN_INTEREST_USD", "50000"))
-            
-            markets = asyncio.run(PolymarketPoller.fetch_all_categories(min_volume, min_oi))
-            
-            # Store in database
-            db = DatabaseManager()
-            db.connect()
-            db.init_schema()
-            new, updated = db.insert_markets(markets)
-            db.close()
-            
-            st.success(f"✅ Refresh complete! {new} new markets, {updated} updated")
-            st.rerun()
+        # Show detailed progress
+        progress_bar = st.progress(0, "🔄 Starting refresh...")
+        status_text = st.empty()
+        
+        def update_progress(step: int, total: int, message: str):
+            progress_bar.progress(min(step / total, 0.99), message)
+            status_text.caption(message)
+        
+        # Step 1: Fetch markets
+        update_progress(1, 4, "🔄 Fetching markets from Polymarket API (13 categories)...")
+        min_volume = float(os.getenv("MIN_VOLUME_USD", "100000"))
+        min_oi = float(os.getenv("MIN_OPEN_INTEREST_USD", "50000"))
+        
+        markets = asyncio.run(PolymarketPoller.fetch_all_categories(min_volume, min_oi))
+        update_progress(2, 4, f"✓ Fetched {len(markets)} markets. Now updating database...")
+        
+        # Step 2: Store in database
+        db = DatabaseManager()
+        db.connect()
+        db.init_schema()
+        new, updated = db.insert_markets(markets)
+        db.close()
+        
+        update_progress(3, 4, f"✓ Database updated: {new} new, {updated} updated")
+        
+        # Step 3: Complete
+        progress_bar.progress(1.0, "✅ Refresh complete!")
+        st.success(f"✅ Data refresh successful! {new} new markets, {updated} updated markets")
+        
+        time.sleep(1)  # Let user see success message
+        st.rerun()
     except Exception as e:
         st.error(f"❌ Refresh failed: {e}")
+        st.error("💡 Tip: Check that Polymarket API is accessible and you have internet connection")
         logger.error(f"Manual refresh error: {e}", exc_info=True)
+    finally:
+        st.session_state.refresh_in_progress = False
 
 
 def parse_json_field(json_str):
@@ -363,7 +392,7 @@ with st.sidebar:
     
     # Time to expiration with smart bucketing
     df_temp = load_markets()
-    df_temp['days_left'] = (df_temp['end_date'] - datetime.now(timezone.utc)).dt.days
+    df_temp['days_left'] = df_temp['end_date'].apply(lambda x: days_until(pd.to_datetime(x, utc=True).to_pydatetime()) if pd.notna(x) else 999)
     max_days = int(df_temp['days_left'].max()) if len(df_temp) > 0 else 365
     
     st.write("**Market Timeline**")
@@ -423,7 +452,14 @@ st.markdown("**Real-time consensus analysis for strategic decision-making**")
 col_refresh, col_status = st.columns([2, 3])
 
 with col_refresh:
-    if st.button("🔄 Refresh Data Now", use_container_width=True, help="Manually fetch latest data from Polymarket API"):
+    # Disable button if refresh is already in progress
+    refresh_disabled = st.session_state.get("refresh_in_progress", False)
+    if st.button(
+        "🔄 Refresh Data Now",
+        use_container_width=True,
+        help="Manually fetch latest data from Polymarket API. Takes 5-10 minutes.",
+        disabled=refresh_disabled
+    ):
         trigger_data_refresh()
 
 with col_status:
@@ -444,7 +480,9 @@ if selected_categories and 'category' in df_filtered.columns:
     df_filtered = df_filtered[df_filtered['category'].isin(selected_categories)]
 
 # Calculate days left for time filtering
-df_filtered['days_left'] = (df_filtered['end_date'] - datetime.now(timezone.utc)).dt.days
+df_filtered['days_left'] = df_filtered['end_date'].apply(
+    lambda x: days_until(pd.to_datetime(x, utc=True).to_pydatetime()) if pd.notna(x) else 999
+)
 df_filtered = df_filtered[
     (df_filtered['days_left'] >= time_min) &
     (df_filtered['days_left'] <= time_max)
@@ -687,12 +725,10 @@ else:
                 if in_watchlist:
                     if st.button("⭐", key=f"watch_{row['id']}", help="Remove from watchlist"):
                         remove_from_watchlist(row['id'])
-                        st.session_state[f"watch_{row['id']}"] = False
                         st.rerun()
                 else:
                     if st.button("☆", key=f"watch_{row['id']}", help="Add to watchlist"):
                         add_to_watchlist(row['id'])
-                        st.session_state[f"watch_{row['id']}"] = True
                         st.rerun()
             
             st.divider()
@@ -709,8 +745,9 @@ else:
                          help="Trading activity. Higher = more liquid, easier to enter/exit positions")
             
             with m3:
-                days = (row['end_date'] - datetime.now(timezone.utc)).days
-                st.metric("Resolution", f"{days}d",
+                end_dt = pd.to_datetime(row['end_date'], utc=True).to_pydatetime()
+                days = days_until(end_dt)
+                st.metric("Resolution", f"{days}d" if days is not None else "N/A",
                          help="Time until certainty. Shorter = near-final verdict, longer = still speculative")
             
             with m4:
@@ -740,17 +777,29 @@ else:
             
             # Outcome probabilities as business decision points
             if outcomes and prices:
-                st.write("**Outcome Probabilities:**")
-                
-                for outcome, price in zip(outcomes, prices):
-                    prob_pct = float(price) * 100
-                    col_label, col_bar = st.columns([1, 4])
-                    
-                    with col_label:
-                        st.write(f"**{outcome}**")
-                    
-                    with col_bar:
-                        st.progress(float(price), f"{prob_pct:.1f}%")
+                try:
+                    if len(outcomes) != len(prices):
+                        st.warning(f"⚠️ Data mismatch: {len(outcomes)} outcomes but {len(prices)} prices")
+                    else:
+                        st.write("**Outcome Probabilities:**")
+                        
+                        for outcome, price in zip(outcomes, prices):
+                            try:
+                                prob_pct = float(price) * 100
+                                col_label, col_bar = st.columns([1, 4])
+                                
+                                with col_label:
+                                    st.write(f"**{outcome}**")
+                                
+                                with col_bar:
+                                    st.progress(float(price), f"{prob_pct:.1f}%")
+                            except (ValueError, TypeError) as e:
+                                st.warning(f"Could not display {outcome}: invalid price value")
+                except Exception as e:
+                    logger.debug(f"Error rendering outcome probabilities: {e}")
+                    st.caption("💡 Outcome probabilities unavailable for this market")
+            elif outcomes or prices:
+                st.caption("⚠️ Incomplete outcome data (missing prices or outcomes)")
     
     # Load More button
     st.divider()
