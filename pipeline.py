@@ -562,6 +562,34 @@ class DatabaseManager:
         return new_count, updated_count
     
     @retry_on_db_lock(max_retries=3, initial_delay=0.1)
+    def purge_inactive_market_snapshots(self) -> int:
+        """Delete snapshots for markets that are no longer active. Returns count of deleted snapshots."""
+        try:
+            cursor = self.conn.cursor()
+            
+            # Find inactive markets
+            cursor.execute("SELECT id FROM markets WHERE active = 0")
+            inactive_ids = [row[0] for row in cursor.fetchall()]
+            
+            if not inactive_ids:
+                logger.debug("No inactive markets found; snapshot cleanup skipped")
+                return 0
+            
+            # Delete snapshots for those markets
+            deleted_count = 0
+            for market_id in inactive_ids:
+                cursor.execute("DELETE FROM snapshots WHERE market_id = ?", (market_id,))
+                deleted_count += cursor.rowcount
+            
+            self.conn.commit()
+            if deleted_count > 0:
+                logger.info(f"[CLEANUP] Purged {deleted_count} snapshots for {len(inactive_ids)} inactive markets")
+            return deleted_count
+            
+        except sqlite3.Error as e:
+            logger.error(f"Failed to purge snapshots: {e}")
+            return 0
+    
     @retry_on_db_lock(max_retries=3, initial_delay=0.1)
     def add_to_watchlist(self, market_id: str) -> bool:
         """Add market to watchlist. Returns True if successful, False if already exists."""
@@ -692,6 +720,12 @@ async def main(min_volume: float | None = None, min_oi: float | None = None):
             db.init_schema()
             new, updated = db.insert_markets(markets)
             logger.info(f"Database: {new} new markets, {updated} updated")
+            
+            # Clean up snapshots for inactive markets if enabled
+            cleanup_strategy = os.getenv("SNAPSHOT_CLEANUP_STRATEGY", "market_active").lower()
+            if cleanup_strategy == "market_active":
+                db.purge_inactive_market_snapshots()
+            
             db.close()
             
             logger.info("Ingestion pipeline completed successfully")

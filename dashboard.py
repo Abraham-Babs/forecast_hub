@@ -147,6 +147,35 @@ def get_refresh_status():
         logger.debug(f"Error computing refresh status: {e}")
         return "❓ Unknown", "gray"
 
+def parse_json_field(value):
+    """Parse JSON-formatted field from database."""
+    if not value:
+        return None
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return value
+
+def display_market_detail(row, market_id_key: str):
+    """Display clickable market button that navigates to detailed market view."""
+    prob = row['probability']
+    verdict = "📈 HIGHLY LIKELY" if prob > 80 else ("📉 HIGHLY UNLIKELY" if prob < 20 else "⚖️ BALANCED")
+    
+    # Create a button that scrolls to the market in the detailed section
+    # Full question text (no truncation) with arrow indicator for affordance
+    if st.button(
+        f"▶ 📊 {row['question']}\n{verdict} | {prob:.0f}% | Capital: ${row['open_interest']:,.0f}",
+        key=f"market_nav_{market_id_key}",
+        use_container_width=True,
+        help="Click to view full market details and trading interface"
+    ):
+        # Store the selected market ID in session state
+        st.session_state.selected_market_id = row['id']
+        st.rerun()
+
+@retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def load_markets():
     """Load all markets from database."""
     try:
@@ -359,6 +388,15 @@ with st.sidebar:
     
     st.divider()
     
+    # Favorites filter
+    show_favorites_only = st.checkbox(
+        "⭐ Show Favorites Only",
+        value=False,
+        help="Display only your watchlist markets"
+    )
+    
+    st.divider()
+    
     # Open Interest threshold slider
     min_open_interest = st.slider(
         "Minimum Open Interest ($)",
@@ -502,6 +540,10 @@ df_filtered['maturity'] = df_filtered['days_left'].apply(get_maturity)
 # Load user's watchlist
 user_watchlist = load_watchlist()
 
+# Apply favorites filter if enabled
+if show_favorites_only:
+    df_filtered = df_filtered[df_filtered['id'].isin(user_watchlist)]
+
 # ============================================================================
 # BUSINESS INSIGHTS SECTION
 # ============================================================================
@@ -576,11 +618,10 @@ with col_hot:
         (df_filtered['probability'] < 20)
     ].nlargest(3, 'open_interest')
     
-    for _, market in extreme.iterrows():
+    for idx, (_, market) in enumerate(extreme.iterrows()):
         prob = market['probability']
         verdict = "📈 HIGHLY LIKELY" if prob > 80 else "📉 HIGHLY UNLIKELY"
-        st.write(f"**{market['question'][:45]}...**")
-        st.caption(f"{verdict} | {prob:.0f}% confidence | Capital: ${market['open_interest']:,.0f}")
+        display_market_detail(market, f"consensus_hot_{idx}")
 
 with col_disagree:
     st.markdown("### ⚖️ Markets in Flux")
@@ -589,10 +630,8 @@ with col_disagree:
     df_filtered['distance_from_50'] = abs(df_filtered['probability'] - 50)
     balanced = df_filtered.nsmallest(3, 'distance_from_50')
     
-    for _, market in balanced.iterrows():
-        prob = market['probability']
-        st.write(f"**{market['question'][:45]}...**")
-        st.caption(f"Split: {prob:.0f}%/{100-prob:.0f}% | Capital: ${market['open_interest']:,.0f}")
+    for idx, (_, market) in enumerate(balanced.iterrows()):
+        display_market_detail(market, f"consensus_flux_{idx}")
 
 with col_critical:
     st.markdown("### 🚨 Resolution Imminent")
@@ -600,11 +639,8 @@ with col_critical:
     
     soon = df_filtered[df_filtered['days_left'] < 7].nlargest(3, 'open_interest')
     
-    for _, market in soon.iterrows():
-        days = market['days_left']
-        prob = market['probability']
-        st.write(f"**{market['question'][:45]}...**")
-        st.caption(f"{prob:.0f}% likely | ⏰ {days:.0f} days | Capital: ${market['open_interest']:,.0f}")
+    for idx, (_, market) in enumerate(soon.iterrows()):
+        display_market_detail(market, f"consensus_imminent_{idx}")
 
 st.divider()
 
@@ -614,49 +650,133 @@ st.divider()
 
 st.subheader("🔍 Find Specific Markets")
 
-# Search box
-search_term = st.text_input(
-    "Search by keyword",
-    placeholder="e.g., Bitcoin, Fed, election, earnings...",
-    help="Search across all market questions"
-)
+# Search box with context-aware filtering
+search_col1, search_col2 = st.columns([4, 0.8])
 
-# Search results with sorting
+with search_col1:
+    search_term = st.text_input(
+        "Search by keyword",
+        placeholder="e.g., Bitcoin, Fed, election, earnings...",
+        help="Search respects active filters - results limited to selected categories, time range, and conviction"
+    )
+
+with search_col2:
+    if search_term:
+        if st.button("✕ Clear", key="clear_search", help="Clear search and show all filtered markets"):
+            st.session_state.search_query = ""
+            st.rerun()
+
+# Smart search results with context-aware filtering
 search_results = df_filtered.copy()
 if search_term:
+    # Filter by keyword
     search_results = search_results[
         search_results['question'].str.contains(search_term, case=False, na=False)
     ]
+    
+    # Sort by relevance (OI as proxy for importance)
+    search_results = search_results.sort_values('open_interest', ascending=False)
 
 if search_term and len(search_results) > 0:
-    # Display result count
-    st.caption(f"📍 Found {len(search_results)} matching markets")
+    # Display result summary
+    filtered_context = []
+    if selected_categories:
+        filtered_context.append(f"in {len(selected_categories)} categories")
+    if time_bucket != "All Markets":
+        filtered_context.append(f"{time_bucket.lower()}")
     
-    # Sorting options
-    col_sort1, col_sort2 = st.columns(2)
-    with col_sort1:
-        sort_by = st.selectbox(
-            "Sort by",
-            ["Conviction (Highest %)", "Liquidity (Highest OI)", "Resolution Time (Soonest)", "Activity (24h Volume)"],
-            key="search_sort"
-        )
+    context_str = f" ({', '.join(filtered_context)})" if filtered_context else ""
+    st.caption(f"✅ Found **{len(search_results)} markets** matching '{search_term}'{context_str}")
     
-    # Apply sorting
-    if sort_by == "Conviction (Highest %)":
-        search_results = search_results.iloc[(search_results['probability'] - 50).abs().argsort()]
-        search_results = search_results.iloc[::-1]  # Highest conviction first
-    elif sort_by == "Liquidity (Highest OI)":
-        search_results = search_results.sort_values('open_interest', ascending=False)
-    elif sort_by == "Resolution Time (Soonest)":
-        search_results = search_results.sort_values('end_date', ascending=True)
-    elif sort_by == "Activity (24h Volume)":
-        search_results = search_results.sort_values('volume', ascending=False)
+    # Show top 5 smart suggestions as compact cards
+    if len(search_results) > 0:
+        st.caption("**Top matches by liquidity:**")
+        top_5 = search_results.head(5)
+        
+        for idx, (_, market) in enumerate(top_5.iterrows()):
+            with st.container(border=True):
+                col_q, col_p, col_oi = st.columns([3, 1, 1.5])
+                
+                with col_q:
+                    st.markdown(f"**{market['question'][:60]}{'...' if len(market['question']) > 60 else ''}**")
+                
+                with col_p:
+                    prob = market['probability']
+                    st.metric("Prob", f"{prob:.0f}%", label_visibility="collapsed")
+                
+                with col_oi:
+                    st.metric("OI", f"${market['open_interest']/1e6:.1f}M", label_visibility="collapsed")
     
-    # Update filtered dataframe to show sorted search results
-    df_filtered = search_results
+    if len(search_results) > 5:
+        st.caption(f"📍 +{len(search_results)-5} more markets match. Scroll to Market Details to see all.")
+    
+    # Sorting options for full search results
+    if len(search_results) > 0:
+        col_sort1, col_sort2 = st.columns(2)
+        with col_sort1:
+            sort_by = st.selectbox(
+                "Sort all results by",
+                ["Liquidity (Highest OI)", "Conviction (Highest %)", "Resolution Time (Soonest)"],
+                key="search_sort"
+            )
+        
+        # Apply sorting
+        if sort_by == "Conviction (Highest %)":
+            search_results = search_results.iloc[(search_results['probability'] - 50).abs().argsort()]
+            search_results = search_results.iloc[::-1]  # Highest conviction first
+        elif sort_by == "Liquidity (Highest OI)":
+            search_results = search_results.sort_values('open_interest', ascending=False)
+        elif sort_by == "Resolution Time (Soonest)":
+            search_results = search_results.sort_values('end_date', ascending=True)
+        
+        # Update filtered dataframe to show sorted search results
+        df_filtered = search_results
 else:
     if search_term:
-        st.info("💡 No markets match your search. Try different keywords: crypto, Fed, politics, earnings, etc.")
+        context_msg = ""
+        if selected_categories or time_bucket != "All Markets" or min_open_interest > 50_000:
+            context_msg = " within your active filters"
+        st.info(f"💡 No markets match '{search_term}'{context_msg}. Try different keywords: crypto, Fed, politics, earnings, etc.")
+
+st.divider()
+
+# ============================================================================
+# ACTIVE FILTERS SUMMARY
+# ============================================================================
+
+# Build active filters list
+active_filters = []
+
+# Category filter
+if selected_categories:
+    active_filters.append(f"📁 {', '.join(selected_categories)}")
+
+# Favorites filter
+if show_favorites_only:
+    active_filters.append("⭐ Favorites Only")
+
+# Open Interest filter
+if min_open_interest > 50_000:
+    active_filters.append(f"💰 Min OI: ${min_open_interest:,.0f}")
+
+# Probability filter
+if prob_min > 0 or prob_max < 100:
+    active_filters.append(f"📊 Probability: {prob_min}%-{prob_max}%")
+
+# Timeline filter
+if time_bucket != "All Markets":
+    active_filters.append(f"⏰ {time_bucket}")
+
+# Display filter summary if any filters are active
+if active_filters:
+    col_filters, col_clear = st.columns([4, 0.6])
+    with col_filters:
+        st.caption(f"**🔍 Active Filters:** {' • '.join(active_filters)}")
+    with col_clear:
+        if st.button("✕ Clear All", key="clear_filters", help="Reset all filters to defaults"):
+            st.session_state.selected_categories = []
+            st.session_state.show_favorites = False
+            st.rerun()
 
 st.divider()
 
@@ -669,12 +789,49 @@ st.subheader(f"📊 Market Details ({len(df_filtered)} markets)")
 if len(df_filtered) == 0:
     st.info("💡 No markets match your filters. Try adjusting the thresholds above.")
 else:
-    # Display count and pagination info
-    remaining = len(df_filtered) - st.session_state.markets_to_show
-    if remaining > 0:
-        st.caption(f"📍 Showing {min(st.session_state.markets_to_show, len(df_filtered))} of {len(df_filtered)} markets (+ {remaining} more)")
-    else:
-        st.caption(f"✅ Showing all {len(df_filtered)} markets")
+    # Sort options - right-aligned with controls
+    sort_col1, sort_col2 = st.columns([4, 1])
+    
+    with sort_col1:
+        # Display count and pagination info
+        remaining = len(df_filtered) - st.session_state.markets_to_show
+        if remaining > 0:
+            st.caption(f"📍 Showing {min(st.session_state.markets_to_show, len(df_filtered))} of {len(df_filtered)} markets (+ {remaining} more)")
+        else:
+            st.caption(f"✅ Showing all {len(df_filtered)} markets")
+    
+    with sort_col2:
+        # Sort selector dropdown
+        sort_option = st.selectbox(
+            "Sort by",
+            options=[
+                "High OI First (💰 Capital)",
+                "High Probability (📈 Conviction)",
+                "Low Probability (📉 Outlier)",
+                "Resolution Soon (⏰ Time)",
+                "Newest Activity",
+                "Open Interest ↓"
+            ],
+            index=0,
+            key="market_sort_selector",
+            help="Rank markets by different factors"
+        )
+    
+    # Apply sorting based on selection
+    if sort_option == "High OI First (💰 Capital)":
+        df_filtered = df_filtered.sort_values('open_interest', ascending=False)
+    elif sort_option == "High Probability (📈 Conviction)":
+        df_filtered = df_filtered.sort_values('probability', ascending=False)
+    elif sort_option == "Low Probability (📉 Outlier)":
+        df_filtered = df_filtered.sort_values('probability', ascending=True)
+    elif sort_option == "Resolution Soon (⏰ Time)":
+        df_filtered = df_filtered.sort_values('end_date', ascending=True)
+    elif sort_option == "Newest Activity":
+        # Note: Would need timestamp field in DB for true "newest activity"
+        # For now, using open_interest as proxy for recent activity
+        df_filtered = df_filtered.sort_values('open_interest', ascending=False)
+    elif sort_option == "Open Interest ↓":
+        df_filtered = df_filtered.sort_values('open_interest', ascending=True)
     
     # Market cards with business focus
     for idx, (_, row) in enumerate(df_filtered.iterrows()):
@@ -705,18 +862,42 @@ else:
         # Check if in watchlist
         in_watchlist = row['id'] in user_watchlist
         
-        with st.container(border=True):
+        # Check if this is the selected market - highlight it with expanded view
+        is_selected = st.session_state.get('selected_market_id') == row['id']
+        
+        # Determine conviction level based on probability
+        prob = row['probability']
+        if prob >= 80 or prob <= 20:
+            conviction = "high"
+            conviction_label = "🟢 High Conviction"
+            conviction_color = "#d4f1d4"  # Light green
+        elif (prob >= 60 and prob <= 80) or (prob >= 20 and prob <= 40):
+            conviction = "moderate"
+            conviction_label = "🟡 Moderate Conviction"
+            conviction_color = "#fff3cd"  # Light yellow
+        else:
+            conviction = "balanced"
+            conviction_label = "⚖️ Balanced"
+            conviction_color = "#e9ecef"  # Light gray
+        
+        with st.container(border=is_selected):
+            # Header with conviction color indicator
+            st.markdown(f"<div style='background-color: {conviction_color}; padding: 12px; border-radius: 6px; margin-bottom: 12px;'>"
+                       f"<b>{conviction_label}</b></div>", unsafe_allow_html=True)
+            
             # Header with category badge, question, and probability + watchlist button
             col_cat, col_q, col_p, col_watch = st.columns([1, 3, 1.2, 0.8])
             
             with col_cat:
-                st.caption(category)
+                if is_selected:
+                    st.caption(f"✨ {category}")
+                else:
+                    st.caption(category)
             
             with col_q:
                 st.markdown(f"### {row['question']}")
             
             with col_p:
-                prob = row['probability']
                 st.metric("Probability", f"{prob:.0f}%", 
                          help="Market consensus (0-100%)", label_visibility="visible")
             
@@ -733,24 +914,20 @@ else:
             
             st.divider()
             
-            # Key metrics for business decisions
-            m1, m2, m3, m4 = st.columns(4)
+            # Key metrics for business decisions (SIMPLIFIED - essential only)
+            m1, m2, m3 = st.columns(3)
             
             with m1:
                 st.metric("Open Interest", f"${row['open_interest']:,.0f}", 
                          help="Total capital at risk. Higher = more confidence, better price discovery")
             
             with m2:
-                st.metric("24h Volume", f"${row['volume']:,.0f}",
-                         help="Trading activity. Higher = more liquid, easier to enter/exit positions")
-            
-            with m3:
                 end_dt = pd.to_datetime(row['end_date'], utc=True).to_pydatetime()
                 days = days_until(end_dt)
                 st.metric("Resolution", f"{days}d" if days is not None else "N/A",
                          help="Time until certainty. Shorter = near-final verdict, longer = still speculative")
             
-            with m4:
+            with m3:
                 status = "🟢 ACTIVE" if row['active'] else "🔴 CLOSED"
                 st.metric("Status", status, label_visibility="collapsed")
             
@@ -761,45 +938,55 @@ else:
             prob_color = "🟢" if prob_val > 50 else "🔴"
             st.progress(prob_val / 100.0, f"{prob_color} {prob_val:.0f}% YES likelihood")
             
-            st.divider()
-            
-            # Historical probability trend
-            prob_history = get_probability_history(row['id'])
-            if len(prob_history) > 1:
-                try:
-                    chart_data = prob_history.set_index('timestamp')
-                    st.line_chart(chart_data['probability'], height=200, use_container_width=True)
-                    st.caption("📈 Historical probability trend")
-                except Exception as e:
-                    logger.debug(f"Could not render chart: {e}")
-            
-            st.divider()
-            
-            # Outcome probabilities as business decision points
-            if outcomes and prices:
-                try:
-                    if len(outcomes) != len(prices):
-                        st.warning(f"⚠️ Data mismatch: {len(outcomes)} outcomes but {len(prices)} prices")
-                    else:
-                        st.write("**Outcome Probabilities:**")
-                        
-                        for outcome, price in zip(outcomes, prices):
-                            try:
-                                prob_pct = float(price) * 100
-                                col_label, col_bar = st.columns([1, 4])
-                                
-                                with col_label:
-                                    st.write(f"**{outcome}**")
-                                
-                                with col_bar:
-                                    st.progress(float(price), f"{prob_pct:.1f}%")
-                            except (ValueError, TypeError) as e:
-                                st.warning(f"Could not display {outcome}: invalid price value")
-                except Exception as e:
-                    logger.debug(f"Error rendering outcome probabilities: {e}")
-                    st.caption("💡 Outcome probabilities unavailable for this market")
-            elif outcomes or prices:
-                st.caption("⚠️ Incomplete outcome data (missing prices or outcomes)")
+            # COLLAPSED DETAILS SECTION (user must expand to see)
+            with st.expander("📊 More Details (Chart & Outcomes)", expanded=False):
+                st.divider()
+                
+                # Historical probability trend
+                prob_history = get_probability_history(row['id'])
+                if len(prob_history) > 1:
+                    try:
+                        chart_data = prob_history.set_index('timestamp')
+                        st.line_chart(chart_data['probability'], height=200, use_container_width=True)
+                        st.caption("📈 Historical probability trend")
+                    except Exception as e:
+                        logger.debug(f"Could not render chart: {e}")
+                else:
+                    st.caption("💡 No historical data available yet")
+                
+                st.divider()
+                
+                # Show additional metric in collapsed section
+                st.metric("24h Volume", f"${row['volume']:,.0f}",
+                         help="Trading activity. Higher = more liquid, easier to enter/exit positions")
+                
+                st.divider()
+                
+                # Outcome probabilities as business decision points
+                if outcomes and prices:
+                    try:
+                        if len(outcomes) != len(prices):
+                            st.warning(f"⚠️ Data mismatch: {len(outcomes)} outcomes but {len(prices)} prices")
+                        else:
+                            st.write("**Outcome Probabilities:**")
+                            
+                            for outcome, price in zip(outcomes, prices):
+                                try:
+                                    prob_pct = float(price) * 100
+                                    col_label, col_bar = st.columns([1, 4])
+                                    
+                                    with col_label:
+                                        st.write(f"**{outcome}**")
+                                    
+                                    with col_bar:
+                                        st.progress(float(price), f"{prob_pct:.1f}%")
+                                except (ValueError, TypeError) as e:
+                                    st.warning(f"Could not display {outcome}: invalid price value")
+                    except Exception as e:
+                        logger.debug(f"Error rendering outcome probabilities: {e}")
+                        st.caption("💡 Outcome probabilities unavailable for this market")
+                elif outcomes or prices:
+                    st.caption("⚠️ Incomplete outcome data (missing prices or outcomes)")
     
     # Load More button
     st.divider()

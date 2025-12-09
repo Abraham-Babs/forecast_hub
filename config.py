@@ -88,6 +88,12 @@ def validate_config():
     except ValueError as e:
         errors.append(f"Invalid rate limit configuration: {e}")
     
+    # === SNAPSHOT CLEANUP ===
+    # Strategy: "market_active" = delete snapshots for inactive markets
+    snapshot_cleanup = os.getenv("SNAPSHOT_CLEANUP_STRATEGY", "market_active").lower()
+    if snapshot_cleanup not in ["market_active", "disabled"]:
+        errors.append(f"Invalid SNAPSHOT_CLEANUP_STRATEGY: {snapshot_cleanup} (must be 'market_active' or 'disabled')")
+    
     # === REPORT RESULTS ===
     if errors:
         error_msg = "Configuration validation failed:\n" + "\n".join(f"  • {e}" for e in errors)
@@ -103,6 +109,7 @@ def validate_config():
         "OI_API_TIMEOUT": oi_timeout,
         "MIN_VOLUME": min_volume,
         "MIN_OI": min_oi,
+        "SNAPSHOT_CLEANUP_STRATEGY": snapshot_cleanup,
     }
 
 
