@@ -202,7 +202,7 @@ def get_refresh_status():
     """Get human-readable refresh status with staleness indicator."""
     last_refresh = get_last_refresh_time()
     if not last_refresh:
-        return "⚠️ Never refreshed", "red"
+        return "Never refreshed", "red"
     
     try:
         last_dt = pd.to_datetime(last_refresh, utc=True).to_pydatetime()
@@ -211,17 +211,17 @@ def get_refresh_status():
         
         minutes_ago = int(delta.total_seconds() / 60)
         if minutes_ago < 1:
-            return "✅ Just updated", "green"
+            return "Just updated", "green"
         elif minutes_ago < 30:
-            return f"✅ Updated {minutes_ago}m ago", "green"
+            return f"Updated {minutes_ago}m ago", "green"
         elif minutes_ago < 60:
-            return f"🟡 Updated {minutes_ago}m ago", "orange"
+            return f"Updated {minutes_ago}m ago", "orange"
         else:
             hours_ago = minutes_ago // 60
-            return f"⚠️ Updated {hours_ago}h ago (stale)", "red"
+            return f"Updated {hours_ago}h ago (stale)", "red"
     except Exception as e:
         logger.debug(f"Error computing refresh status: {e}")
-        return "❓ Unknown", "gray"
+        return "Unknown", "gray"
 
 def parse_json_field(value):
     """Parse JSON-formatted field from database."""
@@ -490,7 +490,7 @@ with st.sidebar:
     
     # Favorites filter
     show_favorites_only = st.checkbox(
-        "⭐ Show Favorites Only",
+        "Show Favorites Only",
         value=False,
         help="Display only your watchlist markets"
     )
@@ -520,11 +520,11 @@ with st.sidebar:
     
     # Show what this range means
     if prob_min > 60 or prob_max < 40:
-        st.caption("🎯 Showing high conviction markets (crowd strongly agrees)")
+        st.caption("Showing high conviction markets (crowd strongly agrees)")
     elif 40 <= prob_min and prob_max <= 60:
-        st.caption("⚖️ Showing balanced markets (crowd is split)")
+        st.caption("Showing balanced markets (crowd is split)")
     else:
-        st.caption("🔍 Showing full spectrum of market opinions")
+        st.caption("Showing full spectrum of market opinions")
     
     st.divider()
     
@@ -554,7 +554,7 @@ with st.sidebar:
     st.divider()
     
     # About
-    with st.expander("ℹ️ Business Intelligence Guide"):
+    with st.expander("Business Intelligence Guide"):
         st.write("""
 **Key Metrics Explained:**
 
@@ -583,7 +583,7 @@ with st.sidebar:
 # MAIN DASHBOARD
 # ============================================================================
 
-st.title("📈 Business Prediction Market Intelligence")
+st.title("Business Prediction Market Intelligence")
 st.markdown("**Real-time consensus analysis for strategic decision-making**")
 
 # Display last refresh timestamp and manual refresh button
@@ -593,7 +593,7 @@ with col_refresh:
     # Disable button if refresh is already in progress
     refresh_disabled = st.session_state.get("refresh_in_progress", False)
     if st.button(
-        "🔄 Refresh Data Now",
+        "Refresh Data Now",
         use_container_width=True,
         help="Manually fetch latest data from Polymarket API. Takes 5-10 minutes.",
         disabled=refresh_disabled
@@ -615,29 +615,29 @@ active_filters = []
 
 # Category filter
 if selected_categories:
-    active_filters.append(f"📁 {', '.join(selected_categories)}")
+    active_filters.append(f"{', '.join(selected_categories)}")
 
 # Favorites filter
 if show_favorites_only:
-    active_filters.append("⭐ Favorites Only")
+    active_filters.append("Favorites Only")
 
 # Open Interest filter
 if min_open_interest > 50_000:
-    active_filters.append(f"💰 Min OI: ${min_open_interest:,.0f}")
+    active_filters.append(f"Min OI: ${min_open_interest:,.0f}")
 
 # Probability filter
 if prob_min > 0 or prob_max < 100:
-    active_filters.append(f"📊 Probability: {prob_min}%-{prob_max}%")
+    active_filters.append(f"Probability: {prob_min}%-{prob_max}%")
 
 # Timeline filter
 if time_bucket != "All Markets":
-    active_filters.append(f"⏰ {time_bucket}")
+    active_filters.append(f"{time_bucket}")
 
 # Display filter summary prominently if any filters are active
 if active_filters:
     col_filters, col_clear = st.columns([4, 0.6])
     with col_filters:
-        st.markdown(f"### 🔍 Active Filters: {' • '.join(active_filters)}")
+        st.markdown(f"### Active Filters: {' • '.join(active_filters)}")
     with col_clear:
         if st.button("✕ Clear All", key="clear_filters_top", help="Reset all filters to defaults"):
             st.session_state.selected_categories = []
@@ -687,7 +687,7 @@ if show_favorites_only:
 # BUSINESS INSIGHTS SECTION
 # ============================================================================
 
-st.subheader("🎯 Market Consensus Analysis")
+st.subheader("Market Consensus Analysis")
 
 col1, col2, col3, col4 = st.columns(4)
 
@@ -698,7 +698,7 @@ with col1:
         (df_filtered['probability'] < 30)
     ).sum()
     st.metric(
-        "🎯 High Conviction",
+        "High Conviction",
         high_consensus,
         f"{high_consensus/len(df_filtered)*100 if len(df_filtered) > 0 else 0:.0f}% of markets",
         help="Markets where experts strongly agree (>70% or <30%)"
@@ -711,7 +711,7 @@ with col2:
         (df_filtered['probability'] < 60)
     ).sum()
     st.metric(
-        "⚖️ Balanced View",
+        "Balanced View",
         disagreement,
         f"{disagreement/len(df_filtered)*100 if len(df_filtered) > 0 else 0:.0f}% of markets",
         help="Markets where experts are divided (40-60%)"
@@ -721,7 +721,7 @@ with col3:
     # Imminent resolutions (<7 days)
     imminent = (df_filtered['days_left'] < 7).sum()
     st.metric(
-        "⏰ Resolutions This Week",
+        "Resolutions This Week",
         imminent,
         f"{imminent/len(df_filtered)*100 if len(df_filtered) > 0 else 0:.0f}% of markets",
         help="Markets with <7 days to resolution"
@@ -732,7 +732,7 @@ with col4:
     high_liquidity_threshold = df_filtered['open_interest'].quantile(0.75)
     high_liq = (df_filtered['open_interest'] > high_liquidity_threshold).sum()
     st.metric(
-        "💰 Highly Liquid",
+        "Highly Liquid",
         high_liq,
         f"Top 25% OI",
         help="Markets with best price discovery"
@@ -744,22 +744,22 @@ st.divider()
 # QUICK BROWSE FILTERS - CONSOLIDATED MARKET DISCOVERY
 # ============================================================================
 
-st.subheader("🔍 Market Discovery")
+st.subheader("Market Discovery")
 
 browse_col1, browse_col2, browse_col3 = st.columns(3)
 
 with browse_col1:
-    if st.button("🔥 Strongest Consensus", use_container_width=True, 
+    if st.button("Strongest Consensus", use_container_width=True, 
                 help="Markets where experts strongly agree (>80% or <20% probability)"):
         st.session_state.quick_filter = "consensus"
 
 with browse_col2:
-    if st.button("⚖️ Markets in Flux", use_container_width=True,
+    if st.button("Markets in Flux", use_container_width=True,
                 help="High disagreement = high risk/reward opportunities (40-60% probability)"):
         st.session_state.quick_filter = "balanced"
 
 with browse_col3:
-    if st.button("🚨 Resolving Soon", use_container_width=True,
+    if st.button("Resolving Soon", use_container_width=True,
                 help="Markets resolving within 7 days - final verdicts emerging"):
         st.session_state.quick_filter = "imminent"
 
@@ -782,10 +782,10 @@ st.divider()
 # DETAILED MARKET ANALYSIS
 # ============================================================================
 
-st.subheader(f"📊 Market Details ({len(df_filtered)} markets)")
+st.subheader(f"Market Details ({len(df_filtered)} markets)")
 
 if len(df_filtered) == 0:
-    st.info("💡 No markets match your filters. Try adjusting the thresholds above.")
+    st.info("No markets match your filters. Try adjusting the thresholds above.")
 else:
     # Sort options - right-aligned with controls
     sort_col1, sort_col2 = st.columns([4, 1])
@@ -794,19 +794,19 @@ else:
         # Display count and pagination info
         remaining = len(df_filtered) - st.session_state.markets_to_show
         if remaining > 0:
-            st.caption(f"📍 Showing {min(st.session_state.markets_to_show, len(df_filtered))} of {len(df_filtered)} markets (+ {remaining} more)")
+            st.caption(f"Showing {min(st.session_state.markets_to_show, len(df_filtered))} of {len(df_filtered)} markets (+ {remaining} more)")
         else:
-            st.caption(f"✅ Showing all {len(df_filtered)} markets")
+            st.caption(f"Showing all {len(df_filtered)} markets")
     
     with sort_col2:
         # Sort selector dropdown
         sort_option = st.selectbox(
             "Sort by",
             options=[
-                "High OI First (💰 Capital)",
-                "High Probability (📈 Conviction)",
-                "Low Probability (📉 Outlier)",
-                "Resolution Soon (⏰ Time)",
+                "High OI First (Capital)",
+                "High Probability (Conviction)",
+                "Low Probability (Outlier)",
+                "Resolution Soon (Time)",
                 "Newest Activity",
                 "Open Interest ↓"
             ],
@@ -816,13 +816,13 @@ else:
         )
     
     # Apply sorting based on selection
-    if sort_option == "High OI First (💰 Capital)":
+    if sort_option == "High OI First (Capital)":
         df_filtered = df_filtered.sort_values('open_interest', ascending=False)
-    elif sort_option == "High Probability (📈 Conviction)":
+    elif sort_option == "High Probability (Conviction)":
         df_filtered = df_filtered.sort_values('probability', ascending=False)
-    elif sort_option == "Low Probability (📉 Outlier)":
+    elif sort_option == "Low Probability (Outlier)":
         df_filtered = df_filtered.sort_values('probability', ascending=True)
-    elif sort_option == "Resolution Soon (⏰ Time)":
+    elif sort_option == "Resolution Soon (Time)":
         df_filtered = df_filtered.sort_values('end_date', ascending=True)
     elif sort_option == "Newest Activity":
         # Note: Would need timestamp field in DB for true "newest activity"
@@ -840,22 +840,29 @@ else:
         outcomes = parse_json_field(row['outcomes'])
         
         # Get category from database or infer from question
+        category_color = "#6b7280"  # Default gray
         if pd.notna(row.get('category')):
             category = row['category']
         else:
             question_lower = row['question'].lower()
             if any(word in question_lower for word in ['bitcoin', 'ethereum', 'crypto', 'xrp', 'solana', 'doge']):
-                category = "🔐 Crypto"
+                category = "Crypto"
+                category_color = "#f97316"  # Orange
             elif any(word in question_lower for word in ['trump', 'biden', 'election', 'congress', 'senate', 'democrat', 'republican', 'president']):
-                category = "🏛️ Politics"
+                category = "Politics"
+                category_color = "#a855f7"  # Purple
             elif any(word in question_lower for word in ['fed', 'interest rate', 'inflation', 'recession', 'gdp', 'unemployment', 'economy', 'stock', 'dow', 'nasdaq', 's&p']):
-                category = "📈 Finance"
+                category = "Finance"
+                category_color = "#eab308"  # Gold
             elif any(word in question_lower for word in ['ai', 'llm', 'openai', 'google', 'meta', 'apple', 'microsoft', 'tech', 'software']):
-                category = "💻 Tech"
+                category = "Tech"
+                category_color = "#22c55e"  # Green
             elif any(word in question_lower for word in ['war', 'conflict', 'russia', 'ukraine', 'israel', 'international']):
-                category = "🌍 Geopolitics"
+                category = "Geopolitics"
+                category_color = "#ef4444"  # Red
             else:
-                category = "📊 Other"
+                category = "Other"
+                category_color = "#6b7280"  # Gray
         
         # Check if in watchlist
         in_watchlist = row['id'] in user_watchlist
@@ -890,48 +897,61 @@ else:
                     f"{prob:.0f}%</div>",
                     unsafe_allow_html=True
                 )
-                st.caption(f"{category}")
+                # Category badge with color - darker background for visibility on dark theme
+                st.markdown(
+                    f"<div style='background-color: {category_color}80; color: white; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; text-align: center; margin-top: 4px;'>"
+                    f"{category}</div>",
+                    unsafe_allow_html=True
+                )
             
             with col_question:
                 # Market question - concise, scannable
-                question_short = row['question'][:70] + "..." if len(row['question']) > 70 else row['question']
-                st.markdown(f"**{question_short}**", help=row['question'])
+                # Clean up markdown formatting from question text
+                question_text = row['question']
+                question_text = question_text.replace('**', '').replace(':help[', '').replace(']', '')
+                question_short = question_text[:70] + "..." if len(question_text) > 70 else question_text
+                st.write(f"**{question_short}**")
             
             with col_oi:
                 # Open Interest - compact
                 oi_m = row['open_interest'] / 1_000_000
-                st.caption(f"💰 {oi_m:.1f}M")
+                st.caption(f"${oi_m:.1f}M")
             
             with col_days:
                 # Days until resolution - compact
                 end_dt = pd.to_datetime(row['end_date'], utc=True).to_pydatetime()
                 days = days_until(end_dt)
                 days_str = f"{days}d" if days is not None else "∞"
-                st.caption(f"⏰ {days_str}")
+                st.caption(f"{days_str}")
             
             with col_watch:
                 # Watchlist button - always visible, no expansion needed
                 if in_watchlist:
-                    if st.button("🔖", key=f"watch_{row['id']}", 
+                    if st.button("❤️", key=f"watch_{row['id']}", 
                                 help="Remove from your watchlist"):
                         remove_from_watchlist(row['id'])
                         st.rerun()
                 else:
-                    if st.button("☆", key=f"watch_{row['id']}",
+                    if st.button("🤍", key=f"watch_{row['id']}",
                                 help="Add to your watchlist"):
                         add_to_watchlist(row['id'])
                         st.rerun()
             
-    # Load More button
-    st.divider()
+            
+    # Sticky Load More button - always accessible
     if st.session_state.markets_to_show < len(df_filtered):
+        remaining = len(df_filtered) - st.session_state.markets_to_show
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
-            if st.button("📥 Load More Markets", use_container_width=True, key="load_more"):
+            if st.button(f"Load {min(PAGINATION_SIZE, remaining)} More Markets", 
+                        use_container_width=True, key="load_more",
+                        help=f"{remaining} markets remaining"):
                 st.session_state.markets_to_show += PAGINATION_SIZE
                 st.rerun()
     else:
-        st.caption("✅ All markets loaded")
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.caption("All markets loaded", help="You've reached the end of the filtered results")
 
 st.divider()
 
