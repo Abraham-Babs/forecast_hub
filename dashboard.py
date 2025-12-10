@@ -20,6 +20,17 @@ from tz_utils import now_utc, days_until, format_relative_time
 import threading
 from queue import Queue, Empty
 
+# ============================================================================
+# PAGE CONFIGURATION - MUST BE FIRST STREAMLIT COMMAND
+# ============================================================================
+
+st.set_page_config(
+    page_title="Polymarket Business Intelligence",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 # Load environment variables
 load_dotenv()
 
@@ -129,17 +140,6 @@ PAGINATION_SIZE = 20  # Show 20 markets per page
 # Initialize pagination state
 if "markets_to_show" not in st.session_state:
     st.session_state.markets_to_show = PAGINATION_SIZE
-
-# ============================================================================
-# PAGE CONFIGURATION
-# ============================================================================
-
-st.set_page_config(
-    page_title="Polymarket Business Intelligence",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
 # ============================================================================
 # HELPER FUNCTIONS
