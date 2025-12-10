@@ -15,6 +15,7 @@ from typing import Any
 from functools import wraps
 from dotenv import load_dotenv
 import aiohttp
+from pydantic import BaseModel, validator, ValidationError
 
 # Load environment variables
 load_dotenv()
@@ -52,170 +53,115 @@ CATEGORIES = {
 }
 
 
-class DataNormalizer:
-    """Validate and normalize market data."""
+class Market(BaseModel):
+    """Validated market model - strict schema enforcement."""
+    id: str
+    question: str
+    condition_id: str
+    liquidity: float
+    volume: float
+    end_date: str
+    active: bool
+    outcomes: list[str]
+    outcome_prices: list[float]
+    probability: float
+    open_interest: float | None = None
+    category: str | None = None
     
-    @staticmethod
-    def validate_volume(volume: float, min_volume: float = 100000) -> bool:
-        """Ensure minimum volume threshold."""
-        try:
-            vol = float(volume) if volume else 0
-            return vol >= min_volume
-        except (ValueError, TypeError) as e:
-            logger.debug(f"Volume validation error: {e}")
-            return False
+    @validator('volume')
+    def volume_must_meet_minimum(cls, v):
+        min_vol = float(os.getenv("MIN_VOLUME_USD", "100000"))
+        if v < min_vol:
+            raise ValueError(f"Volume ${v} below minimum ${min_vol}")
+        return v
     
-    @staticmethod
-    def validate_outcome_prices(outcome_prices: Any) -> bool:
-        """Ensure outcome_prices is valid JSON array with decimals 0-1."""
-        try:
-            if isinstance(outcome_prices, str):
-                prices = json.loads(outcome_prices)
-            else:
-                prices = outcome_prices
-            
-            if not isinstance(prices, list) or len(prices) == 0:
-                return False
-            
-            # Prices can be numbers or strings - convert to float and validate range
-            for p in prices:
-                try:
-                    float_p = float(p)
-                    if not (0 <= float_p <= 1):
-                        return False
-                except (ValueError, TypeError) as e:
-                    logger.debug(f"Outcome price conversion error: {e}")
-                    return False
-            
-            return True
-        except json.JSONDecodeError as e:
-            logger.debug(f"JSON decode error in outcome_prices: {e}")
-            return False
-        except Exception as e:
-            logger.debug(f"Unexpected error validating outcome prices: {e}")
-            return False
+    @validator('outcome_prices')
+    def prices_valid_range(cls, v):
+        if not v or len(v) == 0:
+            raise ValueError("outcome_prices cannot be empty")
+        for p in v:
+            if not (0 <= p <= 1):
+                raise ValueError(f"Price {p} outside valid range [0, 1]")
+        return v
     
-    @staticmethod
-    def validate_outcomes_and_prices_match(outcomes: Any, outcome_prices: Any) -> bool:
-        """Ensure outcomes and outcome_prices arrays have matching lengths."""
-        try:
-            # Parse outcomes
-            if isinstance(outcomes, str):
-                outcomes_list = json.loads(outcomes) if outcomes else []
-            else:
-                outcomes_list = outcomes if outcomes else []
-            
-            # Parse prices
-            if isinstance(outcome_prices, str):
-                prices_list = json.loads(outcome_prices) if outcome_prices else []
-            else:
-                prices_list = outcome_prices if outcome_prices else []
-            
-            # Both must be non-empty and equal length
-            if not outcomes_list or not prices_list:
-                return False
-            
-            if len(outcomes_list) != len(prices_list):
-                logger.debug(
-                    f"Outcomes/prices mismatch: {len(outcomes_list)} outcomes vs "
-                    f"{len(prices_list)} prices"
-                )
-                return False
-            
-            return True
-        except Exception as e:
-            logger.debug(f"Error validating outcomes/prices match: {e}")
-            return False
-    
-    @staticmethod
-    def validate_open_interest(oi: float, min_oi: float = 50000) -> bool:
-        """Ensure minimum open interest threshold."""
-        try:
-            oi_val = float(oi) if oi else 0
-            return oi_val >= min_oi
-        except (ValueError, TypeError) as e:
-            logger.debug(f"Open interest validation error: {e}")
-            return False
-    
-    @staticmethod
-    def normalize(market: dict, min_volume: float = 100000) -> dict | None:
-        """Normalize and validate a single market."""
-        # Extract required fields
-        end_date = market.get('endDate') or market.get('end_date')
-        # API can have liquidity or liquidityAmm
-        liquidity = float(market.get('liquidity') or market.get('liquidityAmm', 0) or 0)
-        volume = float(market.get('volume', 0) or 0)
-        condition_id = market.get('conditionId')
-        outcome_prices = market.get('outcomePrices') or market.get('outcome_prices')
-        outcomes = market.get('outcomes')
-        
-        # Validate fields - filter by volume instead of liquidity
-        if not DataNormalizer.validate_volume(volume, min_volume):
-            return None
-        if not DataNormalizer.validate_outcome_prices(outcome_prices):
-            return None
-        if not condition_id:
-            return None
-        
-        # Validate that outcomes and prices match in length
-        if not DataNormalizer.validate_outcomes_and_prices_match(outcomes, outcome_prices):
-            logger.debug(f"Market {market.get('id')}: outcomes/prices mismatch")
-            return None
-        
-        # Ensure outcome_prices is stored as JSON string
-        if isinstance(outcome_prices, list):
-            outcome_prices_list = outcome_prices
-            outcome_prices_str = json.dumps(outcome_prices)
-        else:
-            outcome_prices_str = outcome_prices
-            outcome_prices_list = json.loads(outcome_prices)
-        
-        # Ensure outcomes is stored as JSON string
-        if isinstance(outcomes, list):
-            outcomes_str = json.dumps(outcomes)
-            outcomes_list = outcomes
-        else:
-            outcomes_str = outcomes
-            outcomes_list = json.loads(outcomes) if outcomes else []
-        
-        # Calculate probability as "Yes" outcome price in percent
-        # The outcomes array is positionally mapped to outcome_prices
-        # e.g., ["Yes", "No"] with [0.25, 0.75] means Yes=25%, No=75%
-        probability = None
-        if outcomes_list and outcome_prices_list:
+    @validator('outcomes', 'outcome_prices', pre=True)
+    def parse_json_if_string(cls, v):
+        if isinstance(v, str):
             try:
-                yes_index = outcomes_list.index("Yes")
-                probability = float(outcome_prices_list[yes_index]) * 100
-            except (ValueError, IndexError):
-                # If "Yes" not found, use first outcome (for non-binary markets)
-                # or reject the market as invalid during database insert
-                logger.debug(
-                    f"Market {market.get('id')}: 'Yes' outcome not found in {outcomes_list}. "
-                    f"Using first outcome price instead."
-                )
+                return json.loads(v)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON: {e}")
+        return v
+    
+    @validator('outcome_prices')
+    def match_outcomes_length(cls, v, values):
+        if 'outcomes' in values and len(values['outcomes']) != len(v):
+            raise ValueError(
+                f"Outcomes ({len(values['outcomes'])}) and prices ({len(v)}) length mismatch"
+            )
+        return v
+    
+    @validator('probability')
+    def probability_valid(cls, v):
+        if not (0 <= v <= 100):
+            raise ValueError(f"Probability {v} outside valid range [0, 100]")
+        return v
+    
+    class Config:
+        str_strip_whitespace = True
+
+
+class DataNormalizer:
+    """Normalize and validate market data - strict fail-fast approach."""
+    
+    @staticmethod
+    def normalize(market: dict, min_volume: float = 100000) -> Market | None:
+        """Normalize and validate market. Returns Market or None if invalid."""
+        try:
+            # Extract and normalize fields
+            end_date = market.get('endDate') or market.get('end_date')
+            liquidity = float(market.get('liquidity') or market.get('liquidityAmm', 0) or 0)
+            volume = float(market.get('volume', 0) or 0)
+            condition_id = market.get('conditionId')
+            outcome_prices = market.get('outcomePrices') or market.get('outcome_prices')
+            outcomes = market.get('outcomes')
+            active = market.get('active', True)
+            
+            # Parse JSON if needed
+            if isinstance(outcome_prices, str):
+                outcome_prices = json.loads(outcome_prices)
+            if isinstance(outcomes, str):
+                outcomes = json.loads(outcomes)
+            
+            # Calculate probability - must have "Yes" outcome
+            probability = None
+            if outcomes and outcome_prices:
                 try:
-                    probability = float(outcome_prices_list[0]) * 100
-                except (ValueError, IndexError, TypeError):
-                    # Completely invalid; will be caught during validation
-                    probability = None
-        
-        # If probability is None, the market lacks valid outcome data
-        if probability is None:
+                    yes_idx = outcomes.index("Yes")
+                    probability = float(outcome_prices[yes_idx]) * 100
+                except (ValueError, IndexError):
+                    raise ValueError(f"'Yes' outcome not found in {outcomes}")
+            
+            # Build model - validation happens here
+            return Market(
+                id=market.get('id'),
+                question=market.get('question'),
+                condition_id=condition_id,
+                liquidity=liquidity,
+                volume=volume,
+                end_date=end_date,
+                active=active,
+                outcomes=outcomes,
+                outcome_prices=outcome_prices,
+                probability=probability,
+                open_interest=None,
+            )
+        except (ValidationError, ValueError, KeyError, json.JSONDecodeError) as e:
+            logger.debug(f"Market validation failed: {e}")
             return None
-        
-        return {
-            'id': market.get('id'),
-            'question': market.get('question'),
-            'condition_id': condition_id,
-            'liquidity': liquidity,
-            'volume': market.get('volume', 0),
-            'end_date': end_date,
-            'active': market.get('active', True),
-            'outcomes': outcomes_str,
-            'outcome_prices': outcome_prices_str,
-            'probability': probability,
-            'open_interest': None,
-        }
+        except Exception as e:
+            logger.debug(f"Unexpected error validating market: {e}")
+            return None
 
 
 class PolymarketPoller:
@@ -257,7 +203,7 @@ class PolymarketPoller:
                     for m in markets:
                         norm = DataNormalizer.normalize(m, min_volume)
                         if norm:
-                            norm['category'] = category  # Add category tracking
+                            norm.category = category  # Set category on Market object
                             normalized.append(norm)
                     logger.info(f"{category} (tag_id={tag_id}): fetched {len(normalized)} valid markets")
                     return normalized
@@ -297,9 +243,9 @@ class PolymarketPoller:
                     all_markets.extend(result)
             
             # Step 2: Fetch OI for ALL markets in parallel with proper indexing
-            markets_with_oi = [m for m in all_markets if m.get('condition_id')]
+            markets_with_oi = [m for m in all_markets if m.condition_id]
             oi_tasks = [
-                PolymarketPoller.fetch_open_interest(session, m.get('condition_id'))
+                PolymarketPoller.fetch_open_interest(session, m.condition_id)
                 for m in markets_with_oi
             ]
             oi_values = await asyncio.gather(*oi_tasks, return_exceptions=True)
@@ -308,20 +254,21 @@ class PolymarketPoller:
             filtered = []
             skipped_count = 0
             failed_oi_count = 0
+            min_oi_val = float(os.getenv("MIN_OPEN_INTEREST_USD", "50000"))
             
             for market, oi_result in zip(markets_with_oi, oi_values):
                 if isinstance(oi_result, Exception):
                     failed_oi_count += 1
-                    logger.debug(f"Failed to fetch OI for market {market.get('id')}: {oi_result}")
+                    logger.debug(f"Failed to fetch OI for market {market.id}: {oi_result}")
                     continue
                 
                 oi = oi_result
-                if oi is not None and DataNormalizer.validate_open_interest(oi, min_oi):
-                    market['open_interest'] = oi
+                if oi is not None and oi >= min_oi_val:
+                    market.open_interest = oi
                     filtered.append(market)
                 else:
                     skipped_count += 1
-                    logger.debug(f"Market {market.get('id')} skipped: OI ${oi} below threshold ${min_oi}")
+                    logger.debug(f"Market {market.id} skipped: OI ${oi} below threshold ${min_oi_val}")
             
             # Log summary of OI filtering results
             if failed_oi_count > 0:
@@ -331,11 +278,11 @@ class PolymarketPoller:
                 )
             if skipped_count > 0:
                 logger.info(
-                    f"[OI FILTER] {skipped_count} markets filtered out (OI < ${min_oi:,.0f})"
+                    f"[OI FILTER] {skipped_count} markets filtered out (OI < ${min_oi_val:,.0f})"
                 )
             
             # Add markets without OI (may not have OI data available)
-            markets_without_oi = [m for m in all_markets if not m.get('condition_id')]
+            markets_without_oi = [m for m in all_markets if not m.condition_id]
             if markets_without_oi:
                 logger.info(f"[NO CONDITION_ID] {len(markets_without_oi)} markets have no condition_id (OI unavailable)")
             filtered.extend(markets_without_oi)
@@ -504,7 +451,7 @@ class DatabaseManager:
         
         for market in markets:
             # Check if market already exists
-            cursor.execute("SELECT id FROM markets WHERE id = ?", (market['id'],))
+            cursor.execute("SELECT id FROM markets WHERE id = ?", (market.id,))
             exists = cursor.fetchone() is not None
             
             cursor.execute("""
@@ -519,19 +466,19 @@ class DatabaseManager:
                     probability = excluded.probability,
                     category = excluded.category
             """, (
-                market['id'],
+                market.id,
                 source_id,
-                market['question'],
-                market['condition_id'],
-                market['liquidity'],
-                market['volume'],
-                market['open_interest'],
-                market['end_date'],
-                market['active'],
-                market['outcomes'],
-                market['outcome_prices'],
-                market['probability'],
-                market.get('category'),
+                market.question,
+                market.condition_id,
+                market.liquidity,
+                market.volume,
+                market.open_interest,
+                market.end_date,
+                market.active,
+                json.dumps(market.outcomes),
+                json.dumps(market.outcome_prices),
+                market.probability,
+                market.category,
             ))
             
             if exists:
@@ -544,11 +491,11 @@ class DatabaseManager:
                 INSERT INTO snapshots (market_id, question, outcome_prices, volume, probability)
                 VALUES (?, ?, ?, ?, ?)
             """, (
-                market['id'],
-                market['question'],
-                market['outcome_prices'],
-                market['volume'],
-                market['probability'],
+                market.id,
+                market.question,
+                json.dumps(market.outcome_prices),
+                market.volume,
+                market.probability,
             ))
         
         # Record last refresh timestamp
