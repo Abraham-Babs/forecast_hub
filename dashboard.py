@@ -878,116 +878,50 @@ else:
             conviction_label = "⚖️ Balanced"
             conviction_color = "#e9ecef"  # Light gray
         
-        with st.container(border=is_selected):
-            # Header with conviction color indicator
-            st.markdown(f"<div style='background-color: {conviction_color}; padding: 12px; border-radius: 6px; margin-bottom: 12px;'>"
-                       f"<b>{conviction_label}</b></div>", unsafe_allow_html=True)
+        # Compact horizontal market card - ONE LINE layout
+        with st.container(border=True):
+            col_prob, col_question, col_oi, col_days, col_watch = st.columns([0.7, 3.5, 1.2, 0.6, 0.8], gap="small")
             
-            # Header with category badge, question, and probability + watchlist button
-            col_cat, col_q, col_p, col_watch = st.columns([1, 3, 1.2, 0.8])
+            with col_prob:
+                # LARGE PROBABILITY - Primary focal point
+                prob_color = "#2ecc71" if prob >= 50 else "#e74c3c"  # Green for YES, Red for NO
+                st.markdown(
+                    f"<div style='background-color: {prob_color}; padding: 8px 4px; border-radius: 4px; text-align: center; font-size: 20px; font-weight: bold; color: white;'>"
+                    f"{prob:.0f}%</div>",
+                    unsafe_allow_html=True
+                )
+                st.caption(f"{category}")
             
-            with col_cat:
-                if is_selected:
-                    st.caption(f"✨ {category}")
-                else:
-                    st.caption(category)
+            with col_question:
+                # Market question - concise, scannable
+                question_short = row['question'][:70] + "..." if len(row['question']) > 70 else row['question']
+                st.markdown(f"**{question_short}**", help=row['question'])
             
-            with col_q:
-                st.markdown(f"### {row['question']}")
+            with col_oi:
+                # Open Interest - compact
+                oi_m = row['open_interest'] / 1_000_000
+                st.caption(f"💰 {oi_m:.1f}M")
             
-            with col_p:
-                st.metric("Probability", f"{prob:.0f}%", 
-                         help="Market consensus (0-100%)", label_visibility="visible")
+            with col_days:
+                # Days until resolution - compact
+                end_dt = pd.to_datetime(row['end_date'], utc=True).to_pydatetime()
+                days = days_until(end_dt)
+                days_str = f"{days}d" if days is not None else "∞"
+                st.caption(f"⏰ {days_str}")
             
             with col_watch:
-                # Watchlist button - full-sized, discoverable
+                # Watchlist button - always visible, no expansion needed
                 if in_watchlist:
-                    if st.button("🔖 Favorited", key=f"watch_{row['id']}", use_container_width=True, 
+                    if st.button("🔖", key=f"watch_{row['id']}", 
                                 help="Remove from your watchlist"):
                         remove_from_watchlist(row['id'])
                         st.rerun()
                 else:
-                    if st.button("🔖 Add", key=f"watch_{row['id']}", use_container_width=True,
+                    if st.button("☆", key=f"watch_{row['id']}",
                                 help="Add to your watchlist"):
                         add_to_watchlist(row['id'])
                         st.rerun()
             
-            st.divider()
-            
-            # Key metrics for business decisions (SIMPLIFIED - essential only)
-            m1, m2, m3 = st.columns(3)
-            
-            with m1:
-                st.metric("Open Interest", f"${row['open_interest']:,.0f}", 
-                         help="Total capital at risk. Higher = more confidence, better price discovery")
-            
-            with m2:
-                end_dt = pd.to_datetime(row['end_date'], utc=True).to_pydatetime()
-                days = days_until(end_dt)
-                st.metric("Resolution", f"{days}d" if days is not None else "N/A",
-                         help="Time until certainty. Shorter = near-final verdict, longer = still speculative")
-            
-            with m3:
-                status = "🟢 ACTIVE" if row['active'] else "🔴 CLOSED"
-                st.metric("Status", status, label_visibility="collapsed")
-            
-            st.divider()
-            
-            # Prediction bar - clear yes/no indicator
-            prob_val = row['probability']
-            prob_color = "🟢" if prob_val > 50 else "🔴"
-            st.progress(prob_val / 100.0, f"{prob_color} {prob_val:.0f}% YES likelihood")
-            
-            # COLLAPSED DETAILS SECTION (user must expand to see)
-            with st.expander("📊 More Details (Chart & Outcomes)", expanded=False):
-                st.divider()
-                
-                # Historical probability trend
-                prob_history = get_probability_history(row['id'])
-                if len(prob_history) > 1:
-                    try:
-                        chart_data = prob_history.set_index('timestamp')
-                        st.line_chart(chart_data['probability'], height=200, use_container_width=True)
-                        st.caption("📈 Historical probability trend")
-                    except Exception as e:
-                        logger.debug(f"Could not render chart: {e}")
-                else:
-                    st.caption("💡 No historical data available yet")
-                
-                st.divider()
-                
-                # Show additional metric in collapsed section
-                st.metric("24h Volume", f"${row['volume']:,.0f}",
-                         help="Trading activity. Higher = more liquid, easier to enter/exit positions")
-                
-                st.divider()
-                
-                # Outcome probabilities as business decision points
-                if outcomes and prices:
-                    try:
-                        if len(outcomes) != len(prices):
-                            st.warning(f"⚠️ Data mismatch: {len(outcomes)} outcomes but {len(prices)} prices")
-                        else:
-                            st.write("**Outcome Probabilities:**")
-                            
-                            for outcome, price in zip(outcomes, prices):
-                                try:
-                                    prob_pct = float(price) * 100
-                                    col_label, col_bar = st.columns([1, 4])
-                                    
-                                    with col_label:
-                                        st.write(f"**{outcome}**")
-                                    
-                                    with col_bar:
-                                        st.progress(float(price), f"{prob_pct:.1f}%")
-                                except (ValueError, TypeError) as e:
-                                    st.warning(f"Could not display {outcome}: invalid price value")
-                    except Exception as e:
-                        logger.debug(f"Error rendering outcome probabilities: {e}")
-                        st.caption("💡 Outcome probabilities unavailable for this market")
-                elif outcomes or prices:
-                    st.caption("⚠️ Incomplete outcome data (missing prices or outcomes)")
-    
     # Load More button
     st.divider()
     if st.session_state.markets_to_show < len(df_filtered):
