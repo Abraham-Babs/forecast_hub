@@ -606,6 +606,45 @@ with col_status:
 
 st.divider()
 
+# ============================================================================
+# ACTIVE FILTERS DISPLAY (STICKY AT TOP)
+# ============================================================================
+
+# Build active filters list
+active_filters = []
+
+# Category filter
+if selected_categories:
+    active_filters.append(f"📁 {', '.join(selected_categories)}")
+
+# Favorites filter
+if show_favorites_only:
+    active_filters.append("⭐ Favorites Only")
+
+# Open Interest filter
+if min_open_interest > 50_000:
+    active_filters.append(f"💰 Min OI: ${min_open_interest:,.0f}")
+
+# Probability filter
+if prob_min > 0 or prob_max < 100:
+    active_filters.append(f"📊 Probability: {prob_min}%-{prob_max}%")
+
+# Timeline filter
+if time_bucket != "All Markets":
+    active_filters.append(f"⏰ {time_bucket}")
+
+# Display filter summary prominently if any filters are active
+if active_filters:
+    col_filters, col_clear = st.columns([4, 0.6])
+    with col_filters:
+        st.markdown(f"### 🔍 Active Filters: {' • '.join(active_filters)}")
+    with col_clear:
+        if st.button("✕ Clear All", key="clear_filters_top", help="Reset all filters to defaults"):
+            st.session_state.selected_categories = []
+            st.session_state.show_favorites = False
+            st.rerun()
+    st.divider()
+
 # Apply filters
 df_filtered = df[
     (df['open_interest'] >= min_open_interest) &
@@ -702,181 +741,40 @@ with col4:
 st.divider()
 
 # ============================================================================
-# STRATEGIC DISCOVERY SECTION
+# QUICK BROWSE FILTERS - CONSOLIDATED MARKET DISCOVERY
 # ============================================================================
 
-st.subheader("✨ Key Markets to Monitor")
+st.subheader("🔍 Market Discovery")
 
-col_hot, col_disagree, col_critical = st.columns(3)
+browse_col1, browse_col2, browse_col3 = st.columns(3)
 
-with col_hot:
-    st.markdown("### 🔥 Strongest Consensus")
-    st.caption("Where the smart money agrees (>80% or <20% probability)")
-    
-    extreme = df_filtered[
+with browse_col1:
+    if st.button("🔥 Strongest Consensus", use_container_width=True, 
+                help="Markets where experts strongly agree (>80% or <20% probability)"):
+        st.session_state.quick_filter = "consensus"
+
+with browse_col2:
+    if st.button("⚖️ Markets in Flux", use_container_width=True,
+                help="High disagreement = high risk/reward opportunities (40-60% probability)"):
+        st.session_state.quick_filter = "balanced"
+
+with browse_col3:
+    if st.button("🚨 Resolving Soon", use_container_width=True,
+                help="Markets resolving within 7 days - final verdicts emerging"):
+        st.session_state.quick_filter = "imminent"
+
+# Apply quick filter if selected
+quick_filter = st.session_state.get('quick_filter', None)
+if quick_filter == "consensus":
+    df_filtered = df_filtered[
         (df_filtered['probability'] > 80) | 
         (df_filtered['probability'] < 20)
-    ].nlargest(3, 'open_interest')
-    
-    for idx, (_, market) in enumerate(extreme.iterrows()):
-        prob = market['probability']
-        verdict = "📈 HIGHLY LIKELY" if prob > 80 else "📉 HIGHLY UNLIKELY"
-        display_market_detail(market, f"consensus_hot_{idx}")
-
-with col_disagree:
-    st.markdown("### ⚖️ Markets in Flux")
-    st.caption("High disagreement = high risk/reward opportunities")
-    
+    ].sort_values('open_interest', ascending=False)
+elif quick_filter == "balanced":
     df_filtered['distance_from_50'] = abs(df_filtered['probability'] - 50)
-    balanced = df_filtered.nsmallest(3, 'distance_from_50')
-    
-    for idx, (_, market) in enumerate(balanced.iterrows()):
-        display_market_detail(market, f"consensus_flux_{idx}")
-
-with col_critical:
-    st.markdown("### 🚨 Resolution Imminent")
-    st.caption("Markets resolving soon - Final verdicts emerging")
-    
-    soon = df_filtered[df_filtered['days_left'] < 7].nlargest(3, 'open_interest')
-    
-    for idx, (_, market) in enumerate(soon.iterrows()):
-        display_market_detail(market, f"consensus_imminent_{idx}")
-
-st.divider()
-
-# ============================================================================
-# SEARCH & DETAILED EXPLORATION
-# ============================================================================
-
-st.subheader("🔍 Find Specific Markets")
-
-# Search box with context-aware filtering
-search_col1, search_col2 = st.columns([4, 0.8])
-
-with search_col1:
-    search_term = st.text_input(
-        "Search by keyword",
-        placeholder="e.g., Bitcoin, Fed, election, earnings...",
-        help="Search respects active filters - results limited to selected categories, time range, and conviction"
-    )
-
-with search_col2:
-    if search_term:
-        if st.button("✕ Clear", key="clear_search", help="Clear search and show all filtered markets"):
-            st.session_state.search_query = ""
-            st.rerun()
-
-# Smart search results with context-aware filtering
-search_results = df_filtered.copy()
-if search_term:
-    # Filter by keyword
-    search_results = search_results[
-        search_results['question'].str.contains(search_term, case=False, na=False)
-    ]
-    
-    # Sort by relevance (OI as proxy for importance)
-    search_results = search_results.sort_values('open_interest', ascending=False)
-
-if search_term and len(search_results) > 0:
-    # Display result summary
-    filtered_context = []
-    if selected_categories:
-        filtered_context.append(f"in {len(selected_categories)} categories")
-    if time_bucket != "All Markets":
-        filtered_context.append(f"{time_bucket.lower()}")
-    
-    context_str = f" ({', '.join(filtered_context)})" if filtered_context else ""
-    st.caption(f"✅ Found **{len(search_results)} markets** matching '{search_term}'{context_str}")
-    
-    # Show top 5 smart suggestions as compact cards
-    if len(search_results) > 0:
-        st.caption("**Top matches by liquidity:**")
-        top_5 = search_results.head(5)
-        
-        for idx, (_, market) in enumerate(top_5.iterrows()):
-            with st.container(border=True):
-                col_q, col_p, col_oi = st.columns([3, 1, 1.5])
-                
-                with col_q:
-                    st.markdown(f"**{market['question'][:60]}{'...' if len(market['question']) > 60 else ''}**")
-                
-                with col_p:
-                    prob = market['probability']
-                    st.metric("Prob", f"{prob:.0f}%", label_visibility="collapsed")
-                
-                with col_oi:
-                    st.metric("OI", f"${market['open_interest']/1e6:.1f}M", label_visibility="collapsed")
-    
-    if len(search_results) > 5:
-        st.caption(f"📍 +{len(search_results)-5} more markets match. Scroll to Market Details to see all.")
-    
-    # Sorting options for full search results
-    if len(search_results) > 0:
-        col_sort1, col_sort2 = st.columns(2)
-        with col_sort1:
-            sort_by = st.selectbox(
-                "Sort all results by",
-                ["Liquidity (Highest OI)", "Conviction (Highest %)", "Resolution Time (Soonest)"],
-                key="search_sort"
-            )
-        
-        # Apply sorting
-        if sort_by == "Conviction (Highest %)":
-            search_results = search_results.iloc[(search_results['probability'] - 50).abs().argsort()]
-            search_results = search_results.iloc[::-1]  # Highest conviction first
-        elif sort_by == "Liquidity (Highest OI)":
-            search_results = search_results.sort_values('open_interest', ascending=False)
-        elif sort_by == "Resolution Time (Soonest)":
-            search_results = search_results.sort_values('end_date', ascending=True)
-        
-        # Update filtered dataframe to show sorted search results
-        df_filtered = search_results
-else:
-    if search_term:
-        context_msg = ""
-        if selected_categories or time_bucket != "All Markets" or min_open_interest > 50_000:
-            context_msg = " within your active filters"
-        st.info(f"💡 No markets match '{search_term}'{context_msg}. Try different keywords: crypto, Fed, politics, earnings, etc.")
-
-st.divider()
-
-# ============================================================================
-# ACTIVE FILTERS SUMMARY
-# ============================================================================
-
-# Build active filters list
-active_filters = []
-
-# Category filter
-if selected_categories:
-    active_filters.append(f"📁 {', '.join(selected_categories)}")
-
-# Favorites filter
-if show_favorites_only:
-    active_filters.append("⭐ Favorites Only")
-
-# Open Interest filter
-if min_open_interest > 50_000:
-    active_filters.append(f"💰 Min OI: ${min_open_interest:,.0f}")
-
-# Probability filter
-if prob_min > 0 or prob_max < 100:
-    active_filters.append(f"📊 Probability: {prob_min}%-{prob_max}%")
-
-# Timeline filter
-if time_bucket != "All Markets":
-    active_filters.append(f"⏰ {time_bucket}")
-
-# Display filter summary if any filters are active
-if active_filters:
-    col_filters, col_clear = st.columns([4, 0.6])
-    with col_filters:
-        st.caption(f"**🔍 Active Filters:** {' • '.join(active_filters)}")
-    with col_clear:
-        if st.button("✕ Clear All", key="clear_filters", help="Reset all filters to defaults"):
-            st.session_state.selected_categories = []
-            st.session_state.show_favorites = False
-            st.rerun()
+    df_filtered = df_filtered.nsmallest(len(df_filtered), 'distance_from_50')
+elif quick_filter == "imminent":
+    df_filtered = df_filtered[df_filtered['days_left'] < 7].sort_values('open_interest', ascending=False)
 
 st.divider()
 
@@ -1002,13 +900,15 @@ else:
                          help="Market consensus (0-100%)", label_visibility="visible")
             
             with col_watch:
-                # Watchlist button
+                # Watchlist button - full-sized, discoverable
                 if in_watchlist:
-                    if st.button("⭐", key=f"watch_{row['id']}", help="Remove from watchlist"):
+                    if st.button("🔖 Favorited", key=f"watch_{row['id']}", use_container_width=True, 
+                                help="Remove from your watchlist"):
                         remove_from_watchlist(row['id'])
                         st.rerun()
                 else:
-                    if st.button("☆", key=f"watch_{row['id']}", help="Add to watchlist"):
+                    if st.button("🔖 Add", key=f"watch_{row['id']}", use_container_width=True,
+                                help="Add to your watchlist"):
                         add_to_watchlist(row['id'])
                         st.rerun()
             
