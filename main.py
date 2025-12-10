@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 background_refresh_running = False
 last_refresh_error = None
 last_successful_refresh = None
+refresh_thread = None  # Reference to thread for health checks
 
 
 def run_refresh():
@@ -47,6 +48,24 @@ def run_refresh():
         error_msg = f"{type(e).__name__}: {e}"
         logger.error(f"[BACKGROUND] Refresh error: {error_msg}", exc_info=False)
         last_refresh_error = error_msg
+
+
+def is_refresh_thread_healthy() -> bool:
+    """Check if background refresh thread is healthy and running."""
+    global refresh_thread, last_successful_refresh
+    
+    if not refresh_thread or not refresh_thread.is_alive():
+        return False
+    
+    # Check if refresh has completed at least once
+    if last_successful_refresh is None:
+        return False
+    
+    # Check if last refresh is too old (>7 hours = 6h refresh + 1h buffer)
+    max_age_seconds = 7 * 3600
+    age_seconds = (datetime.now() - last_successful_refresh).total_seconds()
+    
+    return age_seconds <= max_age_seconds
 
 
 def background_scheduler():
@@ -107,6 +126,13 @@ def main():
     refresh_thread = threading.Thread(target=background_scheduler, daemon=True)
     refresh_thread.start()
     logger.info("Background refresh thread started")
+    
+    # Log initial health status
+    if is_refresh_thread_healthy():
+        logger.info("[HEALTH] Background refresh thread is healthy")
+    else:
+        logger.warning("[HEALTH] Background refresh thread is not yet healthy (initial state)")
+    
     
     # Step 3: Launch dashboard
     print("[3/4] Launching dashboard...\n")

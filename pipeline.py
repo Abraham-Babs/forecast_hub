@@ -15,6 +15,7 @@ from typing import Any
 from functools import wraps
 from dotenv import load_dotenv
 import aiohttp
+import pandas as pd
 from pydantic import BaseModel, validator, ValidationError
 
 # Load environment variables
@@ -442,71 +443,88 @@ class DatabaseManager:
         """UPSERT markets and snapshots. Returns (new_count, updated_count). Retries on DB lock."""
         cursor = self.conn.cursor()
         
-        # Get source ID
-        cursor.execute("SELECT id FROM sources WHERE name = ?", ("Polymarket",))
-        source_id = cursor.fetchone()[0]
-        
-        new_count = 0
-        updated_count = 0
-        
-        for market in markets:
-            # Check if market already exists
-            cursor.execute("SELECT id FROM markets WHERE id = ?", (market.id,))
-            exists = cursor.fetchone() is not None
+        try:
+            # Mark refresh as in-progress (atomic) - prevents dashboard from reading mid-transaction
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "INSERT OR REPLACE INTO metadata (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                ("refresh_in_progress", "true")
+            )
             
-            cursor.execute("""
-                INSERT INTO markets (id, source_id, question, condition_id, liquidity, volume, open_interest, end_date, active, outcomes, outcome_prices, probability, category)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    liquidity = excluded.liquidity,
-                    volume = excluded.volume,
-                    open_interest = excluded.open_interest,
-                    outcomes = excluded.outcomes,
-                    outcome_prices = excluded.outcome_prices,
-                    probability = excluded.probability,
-                    category = excluded.category
-            """, (
-                market.id,
-                source_id,
-                market.question,
-                market.condition_id,
-                market.liquidity,
-                market.volume,
-                market.open_interest,
-                market.end_date,
-                market.active,
-                json.dumps(market.outcomes),
-                json.dumps(market.outcome_prices),
-                market.probability,
-                market.category,
-            ))
+            # Get source ID
+            cursor.execute("SELECT id FROM sources WHERE name = ?", ("Polymarket",))
+            source_id = cursor.fetchone()[0]
             
-            if exists:
-                updated_count += 1
-            else:
-                new_count += 1
+            new_count = 0
+            updated_count = 0
             
-            # Insert snapshot
-            cursor.execute("""
-                INSERT INTO snapshots (market_id, question, outcome_prices, volume, probability)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                market.id,
-                market.question,
-                json.dumps(market.outcome_prices),
-                market.volume,
-                market.probability,
-            ))
-        
-        # Record last refresh timestamp
-        cursor.execute("""
-            INSERT OR REPLACE INTO metadata (key, value, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-        """, ("last_refresh", datetime.now(timezone.utc).isoformat()))
-        
-        self.conn.commit()
-        logger.info(f"Recorded refresh timestamp: {new_count} new, {updated_count} updated")
-        return new_count, updated_count
+            for market in markets:
+                # Check if market already exists
+                cursor.execute("SELECT id FROM markets WHERE id = ?", (market.id,))
+                exists = cursor.fetchone() is not None
+                
+                cursor.execute("""
+                    INSERT INTO markets (id, source_id, question, condition_id, liquidity, volume, open_interest, end_date, active, outcomes, outcome_prices, probability, category)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        liquidity = excluded.liquidity,
+                        volume = excluded.volume,
+                        open_interest = excluded.open_interest,
+                        outcomes = excluded.outcomes,
+                        outcome_prices = excluded.outcome_prices,
+                        probability = excluded.probability,
+                        category = excluded.category
+                """, (
+                    market.id,
+                    source_id,
+                    market.question,
+                    market.condition_id,
+                    market.liquidity,
+                    market.volume,
+                    market.open_interest,
+                    market.end_date,
+                    market.active,
+                    json.dumps(market.outcomes),
+                    json.dumps(market.outcome_prices),
+                    market.probability,
+                    market.category,
+                ))
+                
+                if exists:
+                    updated_count += 1
+                else:
+                    new_count += 1
+                
+                # Insert snapshot
+                cursor.execute("""
+                    INSERT INTO snapshots (market_id, question, outcome_prices, volume, probability)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    market.id,
+                    market.question,
+                    json.dumps(market.outcome_prices),
+                    market.volume,
+                    market.probability,
+                ))
+            
+            # Record last refresh timestamp and mark refresh as complete
+            cursor.execute(
+                "INSERT OR REPLACE INTO metadata (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                ("last_refresh", datetime.now(timezone.utc).isoformat())
+            )
+            cursor.execute(
+                "INSERT OR REPLACE INTO metadata (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                ("refresh_in_progress", "false")
+            )
+            
+            cursor.execute("COMMIT")
+            logger.info(f"Refresh complete (atomic): {new_count} new, {updated_count} updated")
+            return new_count, updated_count
+            
+        except Exception as e:
+            cursor.execute("ROLLBACK")
+            logger.error(f"Insert failed, transaction rolled back: {e}")
+            raise
     
     @retry_on_db_lock(max_retries=3, initial_delay=0.1)
     def purge_inactive_market_snapshots(self) -> int:
@@ -589,16 +607,15 @@ class DatabaseManager:
             return []
     
     @retry_on_db_lock(max_retries=3, initial_delay=0.1)
-    def get_last_refresh(self) -> str | None:
-        """Get the last refresh timestamp from metadata."""
+    def is_refresh_in_progress(self) -> bool:
+        """Check if a refresh is currently in progress."""
         try:
             cursor = self.conn.cursor()
-            cursor.execute("SELECT value FROM metadata WHERE key = 'last_refresh'")
+            cursor.execute("SELECT value FROM metadata WHERE key = 'refresh_in_progress'")
             row = cursor.fetchone()
-            return row[0] if row else None
-        except sqlite3.Error as e:
-            logger.error(f"Failed to get last refresh: {e}")
-            return None
+            return row and row[0] == "true" if row else False
+        except sqlite3.Error:
+            return False
     
     def close(self):
         """Close database connection."""
@@ -703,6 +720,61 @@ async def main(min_volume: float | None = None, min_oi: float | None = None):
     except Exception as e:
         logger.error(f"Pipeline failed: {type(e).__name__}: {e}", exc_info=True)
         return 1
+
+
+def get_refresh_health() -> dict:
+    """Get refresh thread health status. Returns dict with health info."""
+    try:
+        db = DatabaseManager()
+        db.connect()
+        
+        # Check if refresh is in progress
+        in_progress = db.is_refresh_in_progress()
+        
+        # Get last refresh time
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT value FROM metadata WHERE key = 'last_refresh'")
+        last_refresh_row = cursor.fetchone()
+        
+        cursor.execute("SELECT value FROM metadata WHERE key = 'refresh_in_progress'")
+        progress_row = cursor.fetchone()
+        
+        db.close()
+        
+        last_refresh_time = last_refresh_row[0] if last_refresh_row else None
+        is_in_progress = progress_row and progress_row[0] == "true"
+        
+        # Calculate age if we have a timestamp
+        age_minutes = None
+        if last_refresh_time:
+            try:
+                last_dt = pd.to_datetime(last_refresh_time, utc=True).to_pydatetime()
+                age_seconds = (datetime.now(timezone.utc) - last_dt).total_seconds()
+                age_minutes = int(age_seconds / 60)
+            except Exception:
+                pass
+        
+        # Determine health status
+        is_healthy = (
+            last_refresh_time is not None and 
+            not is_in_progress and 
+            (age_minutes is not None and age_minutes <= (6 * 60 + 60))  # 6 hours + 1 hour buffer
+        )
+        
+        return {
+            "healthy": is_healthy,
+            "in_progress": is_in_progress,
+            "last_refresh": last_refresh_time,
+            "age_minutes": age_minutes,
+        }
+    except Exception as e:
+        logger.debug(f"Failed to get refresh health: {e}")
+        return {
+            "healthy": False,
+            "in_progress": False,
+            "last_refresh": None,
+            "age_minutes": None,
+        }
 
 
 if __name__ == "__main__":

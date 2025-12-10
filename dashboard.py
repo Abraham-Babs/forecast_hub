@@ -17,6 +17,8 @@ import time
 from functools import wraps
 from dotenv import load_dotenv
 from tz_utils import now_utc, days_until, format_relative_time
+import threading
+from queue import Queue, Empty
 
 # Load environment variables
 load_dotenv()
@@ -32,6 +34,91 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "polymarket_bi.db")
 if not os.path.exists(DATABASE_PATH):
     if os.path.exists(os.path.join(os.path.dirname(__file__), "..")):
         os.chdir(os.path.dirname(__file__) or ".")
+
+
+# ============================================================================
+# CONNECTION POOL - Thread-safe SQLite connection management
+# ============================================================================
+
+class ConnectionPool:
+    """Simple thread-safe connection pool for SQLite."""
+    
+    def __init__(self, db_path: str, pool_size: int = 5, timeout: float = 10.0):
+        self.db_path = db_path
+        self.pool_size = pool_size
+        self.timeout = timeout
+        self.connections = Queue(maxsize=pool_size)
+        self.lock = threading.Lock()
+        
+        # Pre-create connections
+        for _ in range(pool_size):
+            conn = self._create_connection()
+            self.connections.put(conn)
+        
+        logger.info(f"Connection pool initialized: {pool_size} connections")
+    
+    def _create_connection(self) -> sqlite3.Connection:
+        """Create a new database connection."""
+        conn = sqlite3.connect(self.db_path, timeout=self.timeout, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA cache_size=-64000')
+        return conn
+    
+    def get_connection(self) -> sqlite3.Connection:
+        """Get a connection from the pool."""
+        try:
+            conn = self.connections.get_nowait()
+            # Verify connection is still alive
+            try:
+                conn.execute("SELECT 1")
+                return conn
+            except sqlite3.Error:
+                # Connection dead, create new one
+                return self._create_connection()
+        except Empty:
+            # Pool exhausted, create temporary connection
+            logger.warning("Connection pool exhausted, creating temporary connection")
+            return self._create_connection()
+    
+    def return_connection(self, conn: sqlite3.Connection):
+        """Return a connection to the pool."""
+        try:
+            self.connections.put_nowait(conn)
+        except:
+            # Pool full, close connection
+            try:
+                conn.close()
+            except:
+                pass
+
+
+# Initialize connection pool once
+@st.cache_resource
+def get_connection_pool():
+    """Create and cache the connection pool."""
+    pool = ConnectionPool(DATABASE_PATH, pool_size=5, timeout=10.0)
+    return pool
+
+
+def get_db_connection():
+    """Get a database connection from the pool."""
+    pool = get_connection_pool()
+    return pool.get_connection()
+
+
+def return_db_connection(conn: sqlite3.Connection):
+    """Return a connection to the pool."""
+    if conn:
+        try:
+            pool = get_connection_pool()
+            pool.return_connection(conn)
+        except Exception as e:
+            logger.debug(f"Error returning connection: {e}")
+            try:
+                conn.close()
+            except:
+                pass
 
 # ============================================================================
 # PAGINATION CONFIGURATION
@@ -79,27 +166,12 @@ def retry_on_db_lock(max_retries: int = 3, initial_delay: float = 0.1):
         return wrapper
     return decorator
 
-@st.cache_resource
-def get_db_connection():
-    """Create database connection with concurrency handling (cached for reuse)."""
-    try:
-        # Use 10-second timeout and WAL mode for better concurrency
-        conn = sqlite3.connect(DATABASE_PATH, timeout=10.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA cache_size=-64000')
-        logger.info("Database connection established (WAL mode, 10s timeout)")
-        return conn
-    except sqlite3.Error as e:
-        logger.error(f"Database connection failed: {e}")
-        st.error(f"Failed to connect to database: {e}")
-        st.stop()
 
 @retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def get_max_open_interest():
     """Get maximum open interest value from database. Retries on DB lock."""
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT MAX(open_interest) FROM markets WHERE open_interest > 0")
         result = cursor.fetchone()
@@ -107,12 +179,14 @@ def get_max_open_interest():
     except sqlite3.Error as e:
         logger.error(f"Failed to fetch max OI: {e}")
         return 500_000_000
+    finally:
+        return_db_connection(conn)
 
 @retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def get_last_refresh_time():
     """Get last data refresh timestamp from metadata table. Retries on DB lock."""
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM metadata WHERE key = ? ORDER BY updated_at DESC LIMIT 1", ("last_refresh",))
         result = cursor.fetchone()
@@ -120,6 +194,8 @@ def get_last_refresh_time():
             return result[0]
     except sqlite3.Error as e:
         logger.debug(f"Could not fetch refresh timestamp: {e}")
+    finally:
+        return_db_connection(conn)
     return None
 
 def get_refresh_status():
@@ -177,9 +253,23 @@ def display_market_detail(row, market_id_key: str):
 
 @retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def load_markets():
-    """Load all markets from database."""
+    """Load all markets from database. Waits if refresh is in progress."""
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
+        # Wait for refresh to complete if in progress (max 30 seconds)
+        max_wait = 30
+        wait_interval = 0.5
+        elapsed = 0
+        while elapsed < max_wait:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM metadata WHERE key = 'refresh_in_progress'")
+            row = cursor.fetchone()
+            if row and row[0] == "true":
+                elapsed += wait_interval
+                time.sleep(wait_interval)
+                continue
+            break
+        
         query = """
         SELECT 
             id,
@@ -213,12 +303,14 @@ def load_markets():
         logger.error(f"Failed to load markets: {e}")
         st.error(f"Failed to load market data: {e}")
         return pd.DataFrame()
+    finally:
+        return_db_connection(conn)
 
 @retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def load_watchlist():
     """Load user's watchlist from database."""
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         query = """
         SELECT m.id FROM markets m
         INNER JOIN watchlist w ON m.id = w.market_id
@@ -228,12 +320,14 @@ def load_watchlist():
     except sqlite3.Error as e:
         logger.debug(f"Failed to load watchlist: {e}")
         return set()
+    finally:
+        return_db_connection(conn)
 
 @retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def add_to_watchlist(market_id: str):
     """Add market to watchlist."""
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("INSERT OR IGNORE INTO watchlist (market_id) VALUES (?)", (market_id,))
         conn.commit()
@@ -241,12 +335,14 @@ def add_to_watchlist(market_id: str):
     except sqlite3.Error as e:
         logger.error(f"Failed to add to watchlist: {e}")
         return False
+    finally:
+        return_db_connection(conn)
 
 @retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def remove_from_watchlist(market_id: str):
     """Remove market from watchlist."""
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM watchlist WHERE market_id = ?", (market_id,))
         conn.commit()
@@ -254,12 +350,14 @@ def remove_from_watchlist(market_id: str):
     except sqlite3.Error as e:
         logger.error(f"Failed to remove from watchlist: {e}")
         return False
+    finally:
+        return_db_connection(conn)
 
 @retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def get_probability_history(market_id: str):
     """Get historical probability data for a market."""
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         query = """
         SELECT timestamp, probability FROM snapshots
         WHERE market_id = ?
@@ -272,6 +370,8 @@ def get_probability_history(market_id: str):
     except sqlite3.Error as e:
         logger.debug(f"Failed to load probability history: {e}")
         return pd.DataFrame()
+    finally:
+        return_db_connection(conn)
 
 @retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def trigger_data_refresh():
