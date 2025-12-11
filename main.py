@@ -2,7 +2,7 @@
 """
 Polymarket Business Intelligence - Single Entry Point
 Fetches market data from Polymarket API, then launches interactive dashboard.
-Automatically refreshes data every 30 minutes in background.
+Automatically refreshes data every 6 hours in background.
 
 Usage:
     python main.py
