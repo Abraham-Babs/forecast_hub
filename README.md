@@ -10,10 +10,11 @@ Polymarket BI aggregates high-quality prediction market data and surfaces it in 
 
 - **Filtered markets that matter**: Only shows markets with real capital at stake ($100K+ volume, $50K+ open interest) to eliminate noise and manipulation risk
 - **Data freshness transparency**: Displays when data was last updated; manual refresh button available
-- **Easy discovery**: Search, filter by category, sort by conviction/liquidity/resolution timeline
-- **Watchlist/favorites**: Save important markets for tracking across sessions
-- **Historical trends**: See how probabilities have changed over time
-- **Business insights**: Pre-calculated consensus strength, disagreement zones, and imminent resolutions
+- **Multi-dimensional discovery**: Filter by category, probability conviction, open interest, and resolution timeline. Sort by liquidity, conviction level, or time to resolution
+- **Expandable market details**: Click to view full market question text; compact display prevents UI clutter
+- **Watchlist/favorites**: Save important markets for tracking across sessions (heart icon toggle)
+- **Business metrics dashboard**: Pre-calculated consensus strength, balanced markets, imminent resolutions, and highly liquid markets
+- **Quick browse filters**: "Strongest Consensus" and "Markets in Flux" buttons for rapid exploration
 
 ## Quick Start
 
@@ -22,7 +23,7 @@ uv sync
 python main.py
 ```
 
-This fetches market data and launches the dashboard at `http://localhost:8501`.
+This fetches market data from Polymarket API (13 categories), stores in SQLite, and launches the dashboard at `http://localhost:8501`. Data automatically refreshes every 6 hours in the background.
 
 ## Product Philosophy
 
@@ -34,28 +35,32 @@ This fetches market data and launches the dashboard at `http://localhost:8501`.
 
 1. **High-signal markets only** — Filters for volume + open interest ensure capital is actually at risk. Eliminates the long tail of low-liquidity, potentially manipulated markets.
 
-2. **Data quality is paramount** — Shows when data is stale, allows manual refresh, surface missing data. Companies can't make decisions on data they don't trust.
+2. **Data quality is paramount** — Shows when data is stale, allows manual refresh, surfaces missing data. Companies can't make decisions on data they don't trust.
 
 3. **Category-based navigation** — 13 categories (Economy, Finance, Tech, Crypto, Politics, etc.) because prediction markets are extremely dynamic. Markets appear/disappear by category; filtering helps users find signals in their domain.
 
-4. **Multiple entry points** — Search for specific questions, filter by probability conviction/timeline, or browse curated "strongest consensus" / "high disagreement" / "resolution imminent" sections.
+4. **Multi-filter exploration** — Users can combine filters: probability conviction range (40-60% = balanced, >80% = high consensus), OI thresholds, resolution timeline, and category. Sort by liquidity, probability, or time to resolution.
 
-5. **Persistent watchlists** — Saved to database so users can track specific outcomes across sessions.
+5. **Compact card layout** — Market probability shown prominently (large percentage). Questions are expandable (click to see full text). Watchlist heart icon always visible. Reduces cognitive load while enabling quick scanning.
 
-6. **Historical probability tracking** — Snapshots at each refresh let users see how consensus has shifted.
+6. **Persistent watchlists** — Saved to database so users can track specific outcomes across sessions.
+
+7. **Historical probability tracking** — Snapshots at each refresh let users see how consensus has shifted.
 
 ## How It Works
 
 - **pipeline.py** — Async fetches 13 market categories from Polymarket API + Open Interest API, validates data quality, stores in SQLite with snapshots for trend tracking
-- **dashboard.py** — Streamlit interface for search, discovery, filtering, and decision-making
-- **main.py** — Single entry point; runs pipeline, then launches dashboard with automatic background refreshes every 6 hours
+- **dashboard.py** — Streamlit interface for filtering, sorting, discovery, and decision-making; includes watchlist management and manual refresh button
+- **main.py** — Single entry point; runs initial pipeline, then launches dashboard with automatic background refreshes every 6 hours
 
 ## Setup
 
 ```bash
 uv sync                 # Install dependencies (one-time)
-python main.py          # Full pipeline + dashboard
+python main.py          # Fetch initial data + launch dashboard at http://localhost:8501
 ```
+
+The dashboard will be available at `http://localhost:8501`. Data refreshes automatically every 6 hours in the background; use "Refresh Data Now" button for manual updates.
 
 ### Dashboard Only (using existing data)
 
@@ -63,11 +68,15 @@ python main.py          # Full pipeline + dashboard
 streamlit run dashboard.py
 ```
 
+Uses existing data from database without fetching from API.
+
 ### Pipeline Only (no dashboard)
 
 ```bash
-python pipeline.py
+python -m asyncio -c "from pipeline import main; import asyncio; asyncio.run(main())"
 ```
+
+Fetches and stores data without launching dashboard.
 
 ## Data Sources
 
@@ -129,68 +138,83 @@ Used in API requests:
 
 ## Dashboard Features
 
-The Streamlit dashboard provides real-time visualization of market data:
+The Streamlit dashboard provides real-time filtering and exploration of market data:
 
-- **Key Metrics:** 
-  - Total markets in database
-  - Average liquidity
-  - Total volume
-  - Active market count
+**Sidebar Controls:**
+- Market category filtering (multi-select)
+- Favorites-only toggle
+- Minimum open interest threshold slider
+- Probability conviction range (0-100%)
+- Resolution timeline radio buttons (Today | This Week | Next 30 Days | All Markets)
 
-- **Market Discovery:**
-  - Search markets by keyword/question
-  - Filter by minimum volume and OI thresholds
-  - View market details and probabilities
+**Market Discovery:**
+- "Strongest Consensus" — Filter to markets >80% or <20% conviction
+- "Markets in Flux" — Show balanced markets (40-60% probability range)
+- Smart sorting: Highest OI, Most Likely, Least Likely, Resolving Soonest, Lowest OI
 
-- **Visualizations:**
-  - Liquidity distribution histogram
-  - Volume vs Liquidity scatter plot
+**Market Cards Display:**
+- Probability (large, color-coded: green for YES >50%, red for NO <50%)
+- Market question (expandable, prevents truncation)
+- Open interest (formatted as K/M: $50K, $1.5M)
+- Days to resolution
+- Watchlist heart icon (click to save/unsave)
 
-- **Market Details:**
-  - Question text and market ID
-  - Liquidity and volume
-  - End date and active status
-  - Outcome probabilities
+**Business Metrics:**
+- High Conviction markets (>70% or <30%)
+- Balanced View markets (40-60%)
+- Resolutions This Week
+- Highly Liquid markets (top 25% by OI)
+
+**Manual Controls:**
+- "Refresh Data Now" button (triggers pipeline fetch)
+- Refresh status indicator (shows staleness)
+- Active filter summary with "Clear All" option
+- Pagination (20 markets per page, "Load More" button)
 
 ## Running
 
-### Full Pipeline + Dashboard
+### Full Pipeline + Dashboard (Recommended)
 
 ```bash
 python main.py
 ```
 
-Fetches markets meeting filtering criteria (volume ≥ $100k, OI ≥ $50k) from all 13 categories, stores in SQLite, and launches dashboard at `http://localhost:8501`.
+- Validates configuration
+- Fetches markets from Polymarket API (all 13 categories)
+- Stores in SQLite database
+- Launches dashboard at `http://localhost:8501`
+- Starts background refresh thread (every 6 hours)
+
+Press Ctrl+C to stop. Background thread gracefully shuts down.
 
 ### Dashboard Only
 
 ```bash
-uv run streamlit run dashboard.py
+streamlit run dashboard.py
 ```
 
-Uses existing data from database (no API fetch).
+Uses existing data from database. No API fetch. Useful for exploring data without network access.
 
-### Pipeline Only
+### Manual Pipeline Refresh
 
-```bash
-uv run python pipeline.py
-```
-
-Fetches and stores data without launching dashboard.
+Use the "Refresh Data Now" button in the dashboard sidebar (top right). Takes 5-10 minutes to fetch all 13 categories and OI data.
 
 ## Project Structure
 
 ```
 polymarket/
-├── pipeline.py       # Async data fetching and normalization
-├── dashboard.py      # Streamlit visualization
-├── main.py          # Entry point (runs both)
-├── verify_data.py   # Quick data validation utility
+├── main.py          # Entry point: validates config, runs pipeline, launches dashboard
+├── pipeline.py      # Async data fetching, normalization, and storage
+├── dashboard.py     # Streamlit UI with filtering, sorting, watchlist management
+├── config.py        # Environment variable validation
+├── tz_utils.py      # UTC timezone handling and time utilities
+├── db_utils.py      # Shared database retry logic
 ├── pyproject.toml   # Dependencies (managed by uv)
 ├── uv.lock          # Locked dependency versions
 ├── README.md        # This file
+├── .env.example     # Environment variable template
 ├── .gitignore       # Git ignore rules
-└── polymarket_bi.db # SQLite database (auto-created)
+└── polymarket_bi.db # SQLite database (auto-created on first run)
 ```
 
 ## Data Model
@@ -232,16 +256,37 @@ Managed via `uv` in `pyproject.toml`:
 To set up development environment:
 
 ```bash
-uv sync                    # Install all dependencies
-python main.py            # Run full pipeline + dashboard
-uv run python verify_data.py  # Check database contents
+uv sync                    # Install all dependencies (includes dev dependencies)
+python main.py            # Run full pipeline + dashboard locally
+streamlit run dashboard.py # Run dashboard only (iterate on UI)
 ```
+
+### Code Quality
+
+The codebase follows the project philosophy:
+- **No assumptions**: Validate configuration and data explicitly
+- **Measure everything**: Logging throughout for debugging
+- **Simple code**: <30 lines per function, clear variable names
+- **Type hints**: Pydantic models for all data validation
+- **Error handling**: Explicit error messages, no silent failures
+- **No bloat**: Removed ~40 lines of dead code and duplication
+
+### Key Files to Understand
+
+1. **main.py** — Application lifecycle and background scheduling
+2. **pipeline.py** — Data fetching, validation, and storage logic
+3. **dashboard.py** — User interface and filtering logic
+4. **tz_utils.py** — Time utilities (critical for "days until resolution")
+5. **db_utils.py** — Shared database retry decorator
 
 ## Notes
 
 - First run creates `polymarket_bi.db` automatically
-- Subsequent runs update markets and add snapshots
+- Subsequent runs update markets and add snapshots (preserves historical data)
 - Database persists across runs for trend analysis
-- Dashboard refreshes data with "Fetch Market Data" button
+- Dashboard filters out resolved markets (negative days_left) automatically
+- Open interest formatted as K (thousands) unless ≥ $1M (then M for millions)
+- All timestamps in UTC to prevent daylight saving time issues
+- Background refresh thread runs independently; Ctrl+C safely shuts down
 
 

@@ -15,7 +15,6 @@ import logging
 import threading
 import schedule
 from datetime import datetime
-from pathlib import Path
 from pipeline import main as ingest_main
 from config import validate_config, ConfigError
 

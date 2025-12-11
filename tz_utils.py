@@ -60,7 +60,7 @@ def days_until(end_date: datetime) -> int:
         
         current = now_utc()
         delta = end_date - current
-        return max(0, delta.days)  # Don't return negative
+        return delta.days  # Return actual days (negative if past, allows filtering resolved markets)
     except Exception as e:
         logger.error(f"Error calculating days_until: {e}")
         return None

@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import aiohttp
 import pandas as pd
 from pydantic import BaseModel, validator, ValidationError
+from db_utils import retry_on_db_lock
 
 # Load environment variables
 load_dotenv()
@@ -296,34 +297,6 @@ class PolymarketPoller:
             return filtered
 
 
-def retry_on_db_lock(max_retries: int = 3, initial_delay: float = 0.1):
-    """Decorator to retry database operations on lock with exponential backoff."""
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            delay = initial_delay
-            last_error = None
-            for attempt in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
-                except sqlite3.OperationalError as e:
-                    if "database is locked" in str(e):
-                        last_error = e
-                        if attempt < max_retries - 1:
-                            logger.warning(f"[DB LOCK] Attempt {attempt + 1}/{max_retries}: retrying in {delay:.2f}s")
-                            time.sleep(delay)
-                            delay *= 2  # Exponential backoff
-                        continue
-                    raise
-                except Exception:
-                    raise
-            # If all retries exhausted, raise last error
-            logger.error(f"[DB LOCK] Failed after {max_retries} attempts: {last_error}")
-            raise last_error
-        return wrapper
-    return decorator
-
-
 class DatabaseManager:
     """SQLite database operations with concurrency handling."""
     
@@ -507,18 +480,30 @@ class DatabaseManager:
                     market.probability,
                 ))
             
-            # Record last refresh timestamp and mark refresh as complete
+            # Record last refresh timestamp
             cursor.execute(
                 "INSERT OR REPLACE INTO metadata (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
                 ("last_refresh", datetime.now(timezone.utc).isoformat())
             )
+            
+            # CRITICAL: Mark resolved markets (end_date in past) as inactive
+            # Prevents old markets from persisting after API stops returning them
+            cursor.execute("""
+                UPDATE markets 
+                SET active = 0 
+                WHERE end_date < datetime('now') AND active = 1
+            """)
+            resolved_count = cursor.rowcount
+            if resolved_count > 0:
+                logger.info(f"Marked {resolved_count} resolved markets as inactive")
+            
             cursor.execute(
                 "INSERT OR REPLACE INTO metadata (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
                 ("refresh_in_progress", "false")
             )
             
             cursor.execute("COMMIT")
-            logger.info(f"Refresh complete (atomic): {new_count} new, {updated_count} updated")
+            logger.info(f"Refresh complete (atomic): {new_count} new, {updated_count} updated, {resolved_count} resolved")
             return new_count, updated_count
             
         except Exception as e:
@@ -686,11 +671,17 @@ async def main(min_volume: float | None = None, min_oi: float | None = None):
             logger.info(f"Database: {new} new markets, {updated} updated")
             
             # Clean up snapshots for inactive markets if enabled
-            cleanup_strategy = os.getenv("SNAPSHOT_CLEANUP_STRATEGY", "market_active").lower()
-            if cleanup_strategy == "market_active":
-                db.purge_inactive_market_snapshots()
-            
-            db.close()
+            try:
+                cleanup_strategy = os.getenv("SNAPSHOT_CLEANUP_STRATEGY", "market_active").lower()
+                if cleanup_strategy == "market_active":
+                    deleted = db.purge_inactive_market_snapshots()
+                    if deleted > 0:
+                        logger.info(f"Cleaned up {deleted} stale snapshots")
+            except Exception as cleanup_error:
+                logger.error(f"Snapshot cleanup failed (non-critical): {cleanup_error}")
+                # Continue - this isn't critical to overall success
+            finally:
+                db.close()
             
             logger.info("Ingestion pipeline completed successfully")
             return 0

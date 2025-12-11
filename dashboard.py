@@ -17,6 +17,7 @@ import time
 from functools import wraps
 from dotenv import load_dotenv
 from tz_utils import now_utc, days_until, format_relative_time
+from db_utils import retry_on_db_lock
 import threading
 from queue import Queue, Empty
 
@@ -40,6 +41,16 @@ logger = logging.getLogger(__name__)
 
 # Database configuration
 DATABASE_PATH = os.getenv("DATABASE_PATH", "polymarket_bi.db")
+
+# Format open interest: show in thousands unless >= 1M
+def format_oi(oi: float) -> str:
+    """Format open interest with K/M suffix. Uses K unless >= 1M."""
+    if oi is None or oi == 0:
+        return "$0"
+    if oi >= 1_000_000:
+        return f"${oi/1_000_000:.1f}M"
+    else:
+        return f"${oi/1_000:.0f}K"
 
 # Ensure database can be found
 if not os.path.exists(DATABASE_PATH):
@@ -145,28 +156,6 @@ if "markets_to_show" not in st.session_state:
 # HELPER FUNCTIONS
 # ============================================================================
 
-def retry_on_db_lock(max_retries: int = 3, initial_delay: float = 0.1):
-    """Decorator to retry database operations on lock with exponential backoff."""
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            delay = initial_delay
-            for attempt in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
-                except sqlite3.OperationalError as e:
-                    if "database is locked" in str(e):
-                        if attempt < max_retries - 1:
-                            logger.debug(f"[DB LOCK] Attempt {attempt + 1}/{max_retries}: retrying in {delay:.2f}s")
-                            time.sleep(delay)
-                            delay *= 2
-                        continue
-                    raise
-            raise sqlite3.OperationalError(f"Database locked after {max_retries} retries")
-        return wrapper
-    return decorator
-
-
 @retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def get_max_open_interest():
     """Get maximum open interest value from database. Retries on DB lock."""
@@ -223,34 +212,6 @@ def get_refresh_status():
         logger.debug(f"Error computing refresh status: {e}")
         return "Unknown", "gray"
 
-def parse_json_field(value):
-    """Parse JSON-formatted field from database."""
-    if not value:
-        return None
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except (json.JSONDecodeError, TypeError):
-            return None
-    return value
-
-def display_market_detail(row, market_id_key: str):
-    """Display clickable market button that navigates to detailed market view."""
-    prob = row['probability']
-    verdict = "📈 HIGHLY LIKELY" if prob > 80 else ("📉 HIGHLY UNLIKELY" if prob < 20 else "⚖️ BALANCED")
-    
-    # Create a button that scrolls to the market in the detailed section
-    # Full question text (no truncation) with arrow indicator for affordance
-    if st.button(
-        f"▶ 📊 {row['question']}\n{verdict} | {prob:.0f}% | Capital: ${row['open_interest']:,.0f}",
-        key=f"market_nav_{market_id_key}",
-        use_container_width=True,
-        help="Click to view full market details and trading interface"
-    ):
-        # Store the selected market ID in session state
-        st.session_state.selected_market_id = row['id']
-        st.rerun()
-
 @retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def load_markets():
     """Load all markets from database. Waits if refresh is in progress."""
@@ -284,6 +245,7 @@ def load_markets():
             probability,
             category
         FROM markets
+        WHERE active = 1
         ORDER BY open_interest DESC
         """
         df = pd.read_sql_query(query, conn)
@@ -529,9 +491,9 @@ with st.sidebar:
     st.divider()
     
     # Time to expiration with smart bucketing
-    df_temp = load_markets()
-    df_temp['days_left'] = df_temp['end_date'].apply(lambda x: days_until(pd.to_datetime(x, utc=True).to_pydatetime()) if pd.notna(x) else 999)
-    max_days = int(df_temp['days_left'].max()) if len(df_temp) > 0 else 365
+    # Calculate max_days from already-loaded df to avoid redundant database query
+    df['days_left_for_slider'] = df['end_date'].apply(lambda x: days_until(pd.to_datetime(x, utc=True).to_pydatetime()) if pd.notna(x) else 999)
+    max_days = int(df['days_left_for_slider'].max()) if len(df) > 0 else 365
     
     st.write("**Market Timeline**")
     time_bucket = st.radio(
@@ -623,7 +585,7 @@ if show_favorites_only:
 
 # Open Interest filter
 if min_open_interest > 50_000:
-    active_filters.append(f"Min OI: ${min_open_interest:,.0f}")
+    active_filters.append(f"Min OI: {format_oi(min_open_interest)}")
 
 # Probability filter
 if prob_min > 0 or prob_max < 100:
@@ -660,6 +622,11 @@ if selected_categories and 'category' in df_filtered.columns:
 df_filtered['days_left'] = df_filtered['end_date'].apply(
     lambda x: days_until(pd.to_datetime(x, utc=True).to_pydatetime()) if pd.notna(x) else 999
 )
+
+# CRITICAL FIX: Filter out resolved markets (end_date in past) before applying time window
+# This prevents old resolved markets from showing as "0 days"
+df_filtered = df_filtered[df_filtered['days_left'] >= 0]
+
 df_filtered = df_filtered[
     (df_filtered['days_left'] >= time_min) &
     (df_filtered['days_left'] <= time_max)
@@ -746,7 +713,7 @@ st.divider()
 
 st.subheader("Market Discovery")
 
-browse_col1, browse_col2, browse_col3 = st.columns(3)
+browse_col1, browse_col2 = st.columns(2)
 
 with browse_col1:
     if st.button("Strongest Consensus", use_container_width=True, 
@@ -758,11 +725,6 @@ with browse_col2:
                 help="High disagreement = high risk/reward opportunities (40-60% probability)"):
         st.session_state.quick_filter = "balanced"
 
-with browse_col3:
-    if st.button("Resolving Soon", use_container_width=True,
-                help="Markets resolving within 7 days - final verdicts emerging"):
-        st.session_state.quick_filter = "imminent"
-
 # Apply quick filter if selected
 quick_filter = st.session_state.get('quick_filter', None)
 if quick_filter == "consensus":
@@ -773,8 +735,6 @@ if quick_filter == "consensus":
 elif quick_filter == "balanced":
     df_filtered['distance_from_50'] = abs(df_filtered['probability'] - 50)
     df_filtered = df_filtered.nsmallest(len(df_filtered), 'distance_from_50')
-elif quick_filter == "imminent":
-    df_filtered = df_filtered[df_filtered['days_left'] < 7].sort_values('open_interest', ascending=False)
 
 st.divider()
 
@@ -803,32 +763,27 @@ else:
         sort_option = st.selectbox(
             "Sort by",
             options=[
-                "High OI First (Capital)",
-                "High Probability (Conviction)",
-                "Low Probability (Outlier)",
-                "Resolution Soon (Time)",
-                "Newest Activity",
-                "Open Interest ↓"
+                "Highest Open Interest",
+                "Most Likely",
+                "Least Likely",
+                "Resolving Soonest",
+                "Lowest Open Interest"
             ],
             index=0,
             key="market_sort_selector",
-            help="Rank markets by different factors"
+            help="Rank markets by different factors for decision-making"
         )
     
     # Apply sorting based on selection
-    if sort_option == "High OI First (Capital)":
+    if sort_option == "Highest Open Interest":
         df_filtered = df_filtered.sort_values('open_interest', ascending=False)
-    elif sort_option == "High Probability (Conviction)":
+    elif sort_option == "Most Likely":
         df_filtered = df_filtered.sort_values('probability', ascending=False)
-    elif sort_option == "Low Probability (Outlier)":
+    elif sort_option == "Least Likely":
         df_filtered = df_filtered.sort_values('probability', ascending=True)
-    elif sort_option == "Resolution Soon (Time)":
+    elif sort_option == "Resolving Soonest":
         df_filtered = df_filtered.sort_values('end_date', ascending=True)
-    elif sort_option == "Newest Activity":
-        # Note: Would need timestamp field in DB for true "newest activity"
-        # For now, using open_interest as proxy for recent activity
-        df_filtered = df_filtered.sort_values('open_interest', ascending=False)
-    elif sort_option == "Open Interest ↓":
+    elif sort_option == "Lowest Open Interest":
         df_filtered = df_filtered.sort_values('open_interest', ascending=True)
     
     # Market cards with business focus
@@ -867,23 +822,8 @@ else:
         # Check if in watchlist
         in_watchlist = row['id'] in user_watchlist
         
-        # Check if this is the selected market - highlight it with expanded view
-        is_selected = st.session_state.get('selected_market_id') == row['id']
-        
         # Determine conviction level based on probability
         prob = row['probability']
-        if prob >= 80 or prob <= 20:
-            conviction = "high"
-            conviction_label = "🟢 High Conviction"
-            conviction_color = "#d4f1d4"  # Light green
-        elif (prob >= 60 and prob <= 80) or (prob >= 20 and prob <= 40):
-            conviction = "moderate"
-            conviction_label = "🟡 Moderate Conviction"
-            conviction_color = "#fff3cd"  # Light yellow
-        else:
-            conviction = "balanced"
-            conviction_label = "⚖️ Balanced"
-            conviction_color = "#e9ecef"  # Light gray
         
         # Compact horizontal market card - ONE LINE layout
         with st.container(border=True):
@@ -905,17 +845,16 @@ else:
                 )
             
             with col_question:
-                # Market question - concise, scannable
-                # Clean up markdown formatting from question text
+                # Market question - expandable for long names
                 question_text = row['question']
                 question_text = question_text.replace('**', '').replace(':help[', '').replace(']', '')
                 question_short = question_text[:70] + "..." if len(question_text) > 70 else question_text
-                st.write(f"**{question_short}**")
+                with st.expander(question_short, expanded=False):
+                    st.caption(question_text)
             
             with col_oi:
                 # Open Interest - compact
-                oi_m = row['open_interest'] / 1_000_000
-                st.caption(f"${oi_m:.1f}M")
+                st.caption(format_oi(row['open_interest']))
             
             with col_days:
                 # Days until resolution - compact
