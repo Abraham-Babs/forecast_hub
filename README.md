@@ -1,20 +1,29 @@
 # Polymarket BI — Business Intelligence for Prediction Markets
 
-**Real-time consensus analysis for strategic decision-making**
+**Harness collective intelligence to inform strategic business decisions**
 
-Use crowd-powered forecasts from Polymarket to improve business decisions. Companies rely on prediction markets as a signal for what sophisticated predictors think will happen across economy, technology, politics, and more.
+Polymarket BI brings prediction market data—the aggregate wisdom of thousands of forecasters—to non-technical decision-makers. By monitoring what prediction markets price, businesses gain insight into collective expectations about real-world outcomes (elections, economic indicators, tech launches, etc.). The dashboard aggregates data from Polymarket and Kalshi, automatically identifies overlapping markets across platforms, and surfaces liquidity/pricing discrepancies to help you understand market consensus and spot opportunities.
+
+## Who This Is For
+
+- **Business strategists**: Monitor market sentiment on external events that affect your strategy
+- **Product managers**: Track collective forecasts on product launches, competition, market trends
+- **Risk managers**: Gauge market pricing on regulatory/geopolitical outcomes
+- **Researchers & analysts**: Tap collective intelligence to validate hypotheses
+
+**No blockchain knowledge required.** The dashboard interprets prediction markets for business users.
 
 ## What This Tool Does
 
-Polymarket BI aggregates high-quality prediction market data and surfaces it in an actionable dashboard. Instead of manually checking Polymarket, you get:
+Polymarket BI fetches, deduplicates, and surfaces market data from multiple prediction market platforms:
 
-- **Filtered markets that matter**: Only shows markets with real capital at stake ($100K+ volume, $50K+ open interest) to eliminate noise and manipulation risk
-- **Data freshness transparency**: Displays when data was last updated; manual refresh button available
-- **Multi-dimensional discovery**: Filter by category, probability conviction, open interest, and resolution timeline. Sort by liquidity, conviction level, or time to resolution
-- **Expandable market details**: Click to view full market question text; compact display prevents UI clutter
-- **Watchlist/favorites**: Save important markets for tracking across sessions (heart icon toggle)
-- **Business metrics dashboard**: Pre-calculated consensus strength, balanced markets, imminent resolutions, and highly liquid markets
-- **Quick browse filters**: "Strongest Consensus" and "Markets in Flux" buttons for rapid exploration
+- **Dual-source data**: Fetches from both Polymarket and Kalshi APIs concurrently; tags each market with its source
+- **Cross-platform overlap detection**: Detects the same markets on both Polymarket and Kalshi by 85% question similarity; groups overlapping markets so you can compare liquidity, pricing, and consensus across platforms
+- **Source attribution**: Color-coded badges (Polymarket=blue, Kalshi=orange) show which platform each market comes from
+- **Overlap visualization**: See both versions of overlapping markets side-by-side with full details from each platform
+- **Watchlist/favorites**: Save important markets across sessions
+- **Cache fallback**: If API fails, serves last-known markets from database
+- **Current-state only**: Database refreshes completely each fetch, showing only active markets
 
 ## Quick Start
 
@@ -23,29 +32,63 @@ uv sync
 python main.py
 ```
 
-This fetches market data from Polymarket API (13 categories), stores in SQLite, and launches the dashboard at `http://localhost:8501`. Data automatically refreshes every 6 hours in the background.
+Fetches market data from Polymarket and Kalshi APIs, stores in SQLite, and launches dashboard at `http://localhost:8501`. Data refreshes hourly.
 
-## Product Philosophy
+## Design Philosophy
 
-**Target Users**: Companies making business decisions (forecasting, risk analysis, hedging, timing)
+**Minimal, maintainable code** — Write only what solves the problem. Every line justifies its existence.
 
-**Core Value Proposition**: Use prediction market signals to validate internal forecasts, discover blind spots, and quantify conviction across complex outcomes
+**First principles** — Trust the fetchers; let them handle API details. Pipeline focuses on deduplication and storage. Dashboard shows the data.
+
+**Explicit error handling** — No silent failures. If APIs fail, use cache. If cache is empty, fail loudly.
 
 **Key Design Decisions**:
 
-1. **High-signal markets only** — Filters for volume + open interest ensure capital is actually at risk. Eliminates the long tail of low-liquidity, potentially manipulated markets.
+1. **Dual sources** — Polymarket and Kalshi have the same markets with different liquidity/pricing. Comparing both reveals market depth and consensus strength.
 
-2. **Data quality is paramount** — Shows when data is stale, allows manual refresh, surfaces missing data. Companies can't make decisions on data they don't trust.
+2. **Question similarity detection** — Find market overlaps using `difflib.SequenceMatcher` at 85% similarity threshold. No external dependencies; uses Python stdlib.
 
-3. **Category-based navigation** — 13 categories (Economy, Finance, Tech, Crypto, Politics, etc.) because prediction markets are extremely dynamic. Markets appear/disappear by category; filtering helps users find signals in their domain.
+3. **Keep all overlapping markets** — Don't merge overlapping markets; group them with `duplicate_group_id` and show both versions. Lets users compare prices/liquidity across platforms.
 
-4. **Multi-filter exploration** — Users can combine filters: probability conviction range (40-60% = balanced, >80% = high consensus), OI thresholds, resolution timeline, and category. Sort by liquidity, probability, or time to resolution.
+4. **Current-state only** — Each refresh UPSERTs all active markets and DELETEs resolved ones. No snapshots (Kalshi API doesn't provide probability history). Simple, fast, always accurate.
 
-5. **Compact card layout** — Market probability shown prominently (large percentage). Questions are expandable (click to see full text). Watchlist heart icon always visible. Reduces cognitive load while enabling quick scanning.
+5. **Async concurrent fetching** — Both APIs polled in parallel using `asyncio`. If one fails, other still ingests. If both fail, serve from cache.
 
-6. **Persistent watchlists** — Saved to database so users can track specific outcomes across sessions.
+6. **Source attribution** — Every market tagged with source platform. Dashboard shows badge so users see where data comes from.
 
-7. **Historical probability tracking** — Snapshots at each refresh let users see how consensus has shifted.
+## Architecture
+
+**Data Flow:**
+```
+Polymarket API ──────┐
+                     ├─→ Fetch concurrently
+Kalshi API ──────────┘
+                     ├─→ Tag with source (polymarket | kalshi)
+                     ├─→ Detect duplicates (85% question similarity)
+                     ├─→ UPSERT + DELETE resolved markets
+                     └─→ Dashboard displays source badges + duplicate filter
+```
+
+**Step 1: Fetch**
+- Polymarket API returns markets by category
+- Kalshi API returns event markets
+- Both fetched concurrently via `asyncio`
+- Each market tagged with source
+
+**Step 2: Detect Duplicates**
+- Use `difflib.SequenceMatcher` to compare market questions
+- Markets with ≥85% similarity treated as duplicates
+- Assign `duplicate_group_id` to link related markets
+
+**Step 3: Store**
+- UPSERT current markets into database
+- DELETE any markets not in current fetch (resolved/delisted)
+- Record snapshot for time-series analysis
+
+**Step 4: Display**
+- Dashboard queries database, joins all fields including source + duplicate_group_id
+- Shows source badge on each market card
+- Users can filter "Show Duplicates Only" to see cross-platform matches
 
 ## How It Works
 

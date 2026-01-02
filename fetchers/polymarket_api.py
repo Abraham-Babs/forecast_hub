@@ -2,7 +2,7 @@ import httpx
 import asyncio
 import json
 import logging
-import config as cfg
+from fetchers import config as cfg
 
 logger = logging.getLogger(__name__)
 

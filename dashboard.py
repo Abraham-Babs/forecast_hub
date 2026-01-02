@@ -1,611 +1,214 @@
 #!/usr/bin/env python
-"""
-Polymarket BI - Dashboard Entry Point
-Streamlit dashboard for visualizing prediction market data.
-Run with: streamlit run dashboard.py
-"""
+"""Polymarket BI Dashboard - Streamlit interface for filtering and exploring markets from both Polymarket and Kalshi.
+Displays source attribution (color-coded badges) and allows filtering by duplicate status (cross-platform matches).
+Watchlist saved to database for persistence across sessions."""
 
 import os
 import sqlite3
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 from datetime import datetime, timezone
-import json
 import logging
-import time
-from functools import wraps
-from dotenv import load_dotenv
-from tz_utils import now_utc, days_until, format_relative_time
+from tz_utils import now_utc
 from db_utils import retry_on_db_lock
-import threading
-from queue import Queue, Empty
-
-# ============================================================================
-# PAGE CONFIGURATION - MUST BE FIRST STREAMLIT COMMAND
-# ============================================================================
+from db_manager import DatabaseManager
+import json
 
 st.set_page_config(
-    page_title="Polymarket Business Intelligence",
+    page_title="Polymarket BI",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Load environment variables
-load_dotenv()
-
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Database configuration
 DATABASE_PATH = os.getenv("DATABASE_PATH", "polymarket_bi.db")
 
-# Format open interest: show in thousands unless >= 1M
+# Cache watchlist in session to avoid repeated DB calls
+if 'watchlist_cache' not in st.session_state:
+    st.session_state.watchlist_cache = None
+    st.session_state.watchlist_cache_time = None
+
 def format_oi(oi: float) -> str:
-    """Format open interest with K/M suffix. Uses K unless >= 1M."""
+    """Format open interest/liquidity: K unless >= 1M."""
     if oi is None or oi == 0:
         return "$0"
-    if oi >= 1_000_000:
-        return f"${oi/1_000_000:.1f}M"
-    else:
-        return f"${oi/1_000:.0f}K"
+    return f"${oi/1_000_000:.1f}M" if oi >= 1_000_000 else f"${oi/1_000:.0f}K"
 
-# Ensure database can be found
-if not os.path.exists(DATABASE_PATH):
-    if os.path.exists(os.path.join(os.path.dirname(__file__), "..")):
-        os.chdir(os.path.dirname(__file__) or ".")
-
-
-# ============================================================================
-# CONNECTION POOL - Thread-safe SQLite connection management
-# ============================================================================
-
-class ConnectionPool:
-    """Simple thread-safe connection pool for SQLite."""
-    
-    def __init__(self, db_path: str, pool_size: int = 5, timeout: float = 10.0):
-        self.db_path = db_path
-        self.pool_size = pool_size
-        self.timeout = timeout
-        self.connections = Queue(maxsize=pool_size)
-        self.lock = threading.Lock()
-        
-        # Pre-create connections
-        for _ in range(pool_size):
-            conn = self._create_connection()
-            self.connections.put(conn)
-        
-        logger.info(f"Connection pool initialized: {pool_size} connections")
-    
-    def _create_connection(self) -> sqlite3.Connection:
-        """Create a new database connection."""
-        conn = sqlite3.connect(self.db_path, timeout=self.timeout, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA cache_size=-64000')
-        return conn
-    
-    def get_connection(self) -> sqlite3.Connection:
-        """Get a connection from the pool."""
-        try:
-            conn = self.connections.get_nowait()
-            # Verify connection is still alive
-            try:
-                conn.execute("SELECT 1")
-                return conn
-            except sqlite3.Error:
-                # Connection dead, create new one
-                return self._create_connection()
-        except Empty:
-            # Pool exhausted, create temporary connection
-            logger.warning("Connection pool exhausted, creating temporary connection")
-            return self._create_connection()
-    
-    def return_connection(self, conn: sqlite3.Connection):
-        """Return a connection to the pool."""
-        try:
-            self.connections.put_nowait(conn)
-        except:
-            # Pool full, close connection
-            try:
-                conn.close()
-            except:
-                pass
-
-
-# Initialize connection pool once
-@st.cache_resource
-def get_connection_pool():
-    """Create and cache the connection pool."""
-    pool = ConnectionPool(DATABASE_PATH, pool_size=5, timeout=10.0)
-    return pool
-
-
-def get_db_connection():
-    """Get a database connection from the pool."""
-    pool = get_connection_pool()
-    return pool.get_connection()
-
-
-def return_db_connection(conn: sqlite3.Connection):
-    """Return a connection to the pool."""
-    if conn:
-        try:
-            pool = get_connection_pool()
-            pool.return_connection(conn)
-        except Exception as e:
-            logger.debug(f"Error returning connection: {e}")
-            try:
-                conn.close()
-            except:
-                pass
-
-# ============================================================================
-# PAGINATION CONFIGURATION
-# ============================================================================
-
-PAGINATION_SIZE = 20  # Show 20 markets per page
-
-# Initialize pagination state
-if "markets_to_show" not in st.session_state:
-    st.session_state.markets_to_show = PAGINATION_SIZE
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
 
 @retry_on_db_lock(max_retries=3, initial_delay=0.1)
-def get_max_open_interest():
-    """Get maximum open interest value from database. Retries on DB lock."""
-    conn = get_db_connection()
+def get_db():
+    """Get database connection."""
+    conn = sqlite3.connect(DATABASE_PATH, timeout=10.0, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@retry_on_db_lock(max_retries=3, initial_delay=0.1)
+def load_markets():
+    """Load markets from database including source and duplicate_group_id.
+    Returns DataFrame with all market fields; source='polymarket'|'kalshi' identifies platform.
+    duplicate_group_id links markets that appear on both platforms (based on 85% question similarity)."""
+    conn = get_db()
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT MAX(open_interest) FROM markets WHERE open_interest > 0")
-        result = cursor.fetchone()
-        return int(result[0]) if result and result[0] else 500_000_000
+        query = """
+        SELECT id, question, volume, volume_24h, open_interest, probability, category, source, duplicate_group_id
+        FROM markets
+        ORDER BY open_interest DESC
+        """
+        df = pd.read_sql_query(query, conn)
+        return df
     except sqlite3.Error as e:
-        logger.error(f"Failed to fetch max OI: {e}")
-        return 500_000_000
+        logger.error(f"Failed to load markets: {e}")
+        st.error(f"Database error: {e}")
+        return pd.DataFrame()
     finally:
-        return_db_connection(conn)
+        conn.close()
+
 
 @retry_on_db_lock(max_retries=3, initial_delay=0.1)
 def get_last_refresh_time():
-    """Get last data refresh timestamp from metadata table. Retries on DB lock."""
-    conn = get_db_connection()
+    """Get last refresh timestamp."""
+    conn = get_db()
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM metadata WHERE key = ? ORDER BY updated_at DESC LIMIT 1", ("last_refresh",))
         result = cursor.fetchone()
-        if result and result[0]:
-            return result[0]
-    except sqlite3.Error as e:
-        logger.debug(f"Could not fetch refresh timestamp: {e}")
+        return result[0] if result else None
+    except sqlite3.Error:
+        return None
     finally:
-        return_db_connection(conn)
-    return None
+        conn.close()
+
+
+@retry_on_db_lock(max_retries=3, initial_delay=0.1)
+def load_watchlist():
+    """Load user's watchlist. Cached in session to avoid repeated DB calls."""
+    # Check session cache
+    if st.session_state.watchlist_cache is not None:
+        return st.session_state.watchlist_cache
+    
+    conn = get_db()
+    try:
+        query = "SELECT m.id FROM markets m INNER JOIN watchlist w ON m.id = w.market_id"
+        df = pd.read_sql_query(query, conn)
+        result = set(df['id'].tolist()) if len(df) > 0 else set()
+        st.session_state.watchlist_cache = result
+        return result
+    except sqlite3.Error:
+        st.session_state.watchlist_cache = set()
+        return set()
+    finally:
+        conn.close()
+
+
+@retry_on_db_lock(max_retries=3, initial_delay=0.1)
+def add_to_watchlist(market_id: str):
+    """Add to watchlist."""
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO watchlist (market_id) VALUES (?)", (market_id,))
+        conn.commit()
+        st.session_state.watchlist_cache = None  # Clear cache
+        return True
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
+@retry_on_db_lock(max_retries=3, initial_delay=0.1)
+def remove_from_watchlist(market_id: str):
+    """Remove from watchlist."""
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM watchlist WHERE market_id = ?", (market_id,))
+        conn.commit()
+        st.session_state.watchlist_cache = None  # Clear cache
+        return True
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
 
 def get_refresh_status():
-    """Get human-readable refresh status with staleness indicator."""
+    """Get human-readable refresh status."""
     last_refresh = get_last_refresh_time()
     if not last_refresh:
         return "Never refreshed", "red"
     
     try:
         last_dt = pd.to_datetime(last_refresh, utc=True).to_pydatetime()
-        current_dt = now_utc()
-        delta = current_dt - last_dt
-        
+        delta = now_utc() - last_dt
         minutes_ago = int(delta.total_seconds() / 60)
+        
         if minutes_ago < 1:
             return "Just updated", "green"
-        elif minutes_ago < 30:
-            return f"Updated {minutes_ago}m ago", "green"
         elif minutes_ago < 60:
-            return f"Updated {minutes_ago}m ago", "orange"
+            return f"Updated {minutes_ago}m ago", "green"
         else:
             hours_ago = minutes_ago // 60
-            return f"Updated {hours_ago}h ago (stale)", "red"
-    except Exception as e:
-        logger.debug(f"Error computing refresh status: {e}")
+            return f"Updated {hours_ago}h ago", "orange" if hours_ago < 7 else "red"
+    except Exception:
         return "Unknown", "gray"
-
-@retry_on_db_lock(max_retries=3, initial_delay=0.1)
-def load_markets():
-    """Load all markets from database. Waits if refresh is in progress."""
-    conn = get_db_connection()
-    try:
-        # Wait for refresh to complete if in progress (max 30 seconds)
-        max_wait = 30
-        wait_interval = 0.5
-        elapsed = 0
-        while elapsed < max_wait:
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM metadata WHERE key = 'refresh_in_progress'")
-            row = cursor.fetchone()
-            if row and row[0] == "true":
-                elapsed += wait_interval
-                time.sleep(wait_interval)
-                continue
-            break
-        
-        query = """
-        SELECT 
-            id,
-            question,
-            condition_id,
-            volume,
-            open_interest,
-            end_date,
-            active,
-            outcomes,
-            outcome_prices,
-            probability,
-            category
-        FROM markets
-        WHERE active = 1
-        ORDER BY open_interest DESC
-        """
-        df = pd.read_sql_query(query, conn)
-        
-        if len(df) == 0:
-            return df
-        
-        # Safely parse dates
-        try:
-            df['end_date'] = pd.to_datetime(df['end_date'], format='ISO8601', utc=True)
-        except Exception as e:
-            logger.warning(f"Date parsing failed: {e}. Using fallback parsing.")
-            df['end_date'] = pd.to_datetime(df['end_date'], errors='coerce')
-        
-        return df
-    except sqlite3.Error as e:
-        logger.error(f"Failed to load markets: {e}")
-        st.error(f"Failed to load market data: {e}")
-        return pd.DataFrame()
-    finally:
-        return_db_connection(conn)
-
-@retry_on_db_lock(max_retries=3, initial_delay=0.1)
-def load_watchlist():
-    """Load user's watchlist from database."""
-    conn = get_db_connection()
-    try:
-        query = """
-        SELECT m.id FROM markets m
-        INNER JOIN watchlist w ON m.id = w.market_id
-        """
-        df = pd.read_sql_query(query, conn)
-        return set(df['id'].tolist()) if len(df) > 0 else set()
-    except sqlite3.Error as e:
-        logger.debug(f"Failed to load watchlist: {e}")
-        return set()
-    finally:
-        return_db_connection(conn)
-
-@retry_on_db_lock(max_retries=3, initial_delay=0.1)
-def add_to_watchlist(market_id: str):
-    """Add market to watchlist."""
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO watchlist (market_id) VALUES (?)", (market_id,))
-        conn.commit()
-        return True
-    except sqlite3.Error as e:
-        logger.error(f"Failed to add to watchlist: {e}")
-        return False
-    finally:
-        return_db_connection(conn)
-
-@retry_on_db_lock(max_retries=3, initial_delay=0.1)
-def remove_from_watchlist(market_id: str):
-    """Remove market from watchlist."""
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM watchlist WHERE market_id = ?", (market_id,))
-        conn.commit()
-        return True
-    except sqlite3.Error as e:
-        logger.error(f"Failed to remove from watchlist: {e}")
-        return False
-    finally:
-        return_db_connection(conn)
-
-@retry_on_db_lock(max_retries=3, initial_delay=0.1)
-def get_probability_history(market_id: str):
-    """Get historical probability data for a market."""
-    conn = get_db_connection()
-    try:
-        query = """
-        SELECT timestamp, probability FROM snapshots
-        WHERE market_id = ?
-        ORDER BY timestamp ASC
-        """
-        df = pd.read_sql_query(query, conn, params=(market_id,))
-        if len(df) > 0:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-        return df
-    except sqlite3.Error as e:
-        logger.debug(f"Failed to load probability history: {e}")
-        return pd.DataFrame()
-    finally:
-        return_db_connection(conn)
-
-@retry_on_db_lock(max_retries=3, initial_delay=0.1)
-def trigger_data_refresh():
-    """Trigger a manual data refresh by calling the pipeline."""
-    # Debouncing: prevent multiple simultaneous refreshes
-    if "refresh_in_progress" not in st.session_state:
-        st.session_state.refresh_in_progress = False
-    
-    if st.session_state.refresh_in_progress:
-        st.warning("⏳ Refresh already in progress. Please wait...")
-        return
-    
-    try:
-        st.session_state.refresh_in_progress = True
-        
-        from pipeline import DatabaseManager
-        import asyncio
-        from pipeline import PolymarketPoller
-        
-        # Show detailed progress
-        progress_bar = st.progress(0, "🔄 Starting refresh...")
-        status_text = st.empty()
-        
-        def update_progress(step: int, total: int, message: str):
-            progress_bar.progress(min(step / total, 0.99), message)
-            status_text.caption(message)
-        
-        # Step 1: Fetch markets
-        update_progress(1, 4, "🔄 Fetching markets from Polymarket API (13 categories)...")
-        min_volume = float(os.getenv("MIN_VOLUME_USD", "100000"))
-        min_oi = float(os.getenv("MIN_OPEN_INTEREST_USD", "50000"))
-        
-        markets = asyncio.run(PolymarketPoller.fetch_all_categories(min_volume, min_oi))
-        update_progress(2, 4, f"✓ Fetched {len(markets)} markets. Now updating database...")
-        
-        # Step 2: Store in database
-        db = DatabaseManager()
-        db.connect()
-        db.init_schema()
-        new, updated = db.insert_markets(markets)
-        db.close()
-        
-        update_progress(3, 4, f"✓ Database updated: {new} new, {updated} updated")
-        
-        # Step 3: Complete
-        progress_bar.progress(1.0, "✅ Refresh complete!")
-        st.success(f"✅ Data refresh successful! {new} new markets, {updated} updated markets")
-        
-        time.sleep(1)  # Let user see success message
-        st.rerun()
-    except Exception as e:
-        st.error(f"❌ Refresh failed: {e}")
-        st.error("💡 Tip: Check that Polymarket API is accessible and you have internet connection")
-        logger.error(f"Manual refresh error: {e}", exc_info=True)
-    finally:
-        st.session_state.refresh_in_progress = False
-
-
-def parse_json_field(json_str):
-    """Parse JSON string safely."""
-    try:
-        return json.loads(json_str) if json_str else []
-    except json.JSONDecodeError as e:
-        logger.warning(f"JSON parse error: {e}")
-        return []
-
-# ============================================================================
-# MAIN CONTENT STARTS HERE
-# ============================================================================
-
-# Load market data first
-df = load_markets()
-
-# Show staleness warning if data is old
-refresh_status, status_color = get_refresh_status()
-if "stale" in refresh_status.lower():
-    st.warning(f"⚠️ {refresh_status} - Data may be outdated. Live updates temporarily unavailable.")
-elif "never" in refresh_status.lower():
-    st.error("❌ No data available. Pipeline has not run yet.")
-
-if len(df) == 0:
-    st.warning("⚠️ No data in database. Please run the data pipeline first.")
-    st.info("Run: `python main.py`")
-    st.stop()
-
-# Prepare filtering variables
-max_open_interest = get_max_open_interest()
-open_interest_step = max(1000, max_open_interest // 100)
-
-# ============================================================================
-# SIDEBAR CONTROLS
-# ============================================================================
-
-with st.sidebar:
-    st.header("🎚️ Filters")
-    
-    st.divider()
-    
-    # Category/tag filtering - only show categories with active markets
-    if 'category' in df.columns and len(df) > 0:
-        # Count markets per category
-        category_counts = df['category'].value_counts().sort_index()
-        # Only include categories with at least one market
-        available_categories = sorted([cat for cat in category_counts[category_counts > 0].index.tolist()])
-    else:
-        available_categories = []
-    
-    selected_categories = st.multiselect(
-        "Market Categories",
-        available_categories if available_categories else ["No categories found"],
-        default=[],
-        help="Filter to specific prediction market categories. Leave empty to see all markets."
-    )
-    
-    st.divider()
-    
-    # Favorites filter
-    show_favorites_only = st.checkbox(
-        "Show Favorites Only",
-        value=False,
-        help="Display only your watchlist markets"
-    )
-    
-    st.divider()
-    
-    # Open Interest threshold slider
-    min_open_interest = st.slider(
-        "Minimum Open Interest ($)",
-        min_value=50_000,
-        max_value=max_open_interest,
-        value=50_000,
-        step=open_interest_step,
-        format="$%d",
-        help="Markets below this liquidity level are excluded"
-    )
-    
-    st.divider()
-    
-    # Probability range filtering with business context
-    st.write("**Probability Conviction Range**")
-    prob_min, prob_max = st.slider(
-        "Filter markets by YES probability",
-        0, 100, (0, 100),
-        help="Show markets where the crowd thinks YES has between X% and Y% chance. Use to find consensus or disagreement zones."
-    )
-    
-    # Show what this range means
-    if prob_min > 60 or prob_max < 40:
-        st.caption("Showing high conviction markets (crowd strongly agrees)")
-    elif 40 <= prob_min and prob_max <= 60:
-        st.caption("Showing balanced markets (crowd is split)")
-    else:
-        st.caption("Showing full spectrum of market opinions")
-    
-    st.divider()
-    
-    # Time to expiration with smart bucketing
-    # Calculate max_days from already-loaded df to avoid redundant database query
-    df['days_left_for_slider'] = df['end_date'].apply(lambda x: days_until(pd.to_datetime(x, utc=True).to_pydatetime()) if pd.notna(x) else 999)
-    max_days = int(df['days_left_for_slider'].max()) if len(df) > 0 else 365
-    
-    st.write("**Market Timeline**")
-    time_bucket = st.radio(
-        "When do you want markets to resolve?",
-        ["Today (0-1 days)", "This Week (2-7 days)", "Next 30 Days (8-30 days)", "All Markets"],
-        horizontal=True,
-        index=3,
-        help="Markets resolving sooner are more informative; longer-dated markets are more speculative"
-    )
-    
-    if time_bucket == "Today (0-1 days)":
-        time_min, time_max = 0, 1
-    elif time_bucket == "This Week (2-7 days)":
-        time_min, time_max = 2, 7
-    elif time_bucket == "Next 30 Days (8-30 days)":
-        time_min, time_max = 8, 30
-    else:
-        time_min, time_max = 0, max_days
-    
-    st.divider()
-    
-    # About
-    with st.expander("Business Intelligence Guide"):
-        st.write("""
-**Key Metrics Explained:**
-
-- **Probability %** - Market's implicit forecast (higher = more certain)
-- **Open Interest (OI)** - Capital at risk in this market (higher = more reliable signal)
-- **24h Volume** - Recent trading activity (shows market engagement)
-- **Days to Resolution** - Time remaining (shorter = more informative, longer = more speculative)
-- **Market Maturity** - Today = near-final predictions, Week = active forecasts, 30+ days = speculative
-
-**How to use this dashboard:**
-
-1. **Find Consensus** - Markets above 70% or below 30% show strong expert agreement
-2. **Spot Disagreement** - Markets near 50/50 highlight where opinion diverges (risk zones)
-3. **Trust Older Predictions** - Markets resolved soon carry more predictive weight
-4. **Check Liquidity** - Higher OI = more reliable prices; low OI = potentially noisy
-
-**Business Use Cases:**
-- Forecast planning (What does the market predict?)
-- Risk assessment (Where is opinion split?)
-- Decision timing (When is conviction strongest?)
-- Hedging (Which outcomes are underpriced?)
-""")
 
 
 # ============================================================================
 # MAIN DASHBOARD
 # ============================================================================
 
-st.title("Business Prediction Market Intelligence")
-st.markdown("**Real-time consensus analysis for strategic decision-making**")
+# Load data
+df = load_markets()
 
-# Display last refresh timestamp and manual refresh button
-col_refresh, col_status = st.columns([2, 3])
+if len(df) == 0:
+    st.warning("⚠️ No data available. Run: `python main.py`")
+    st.stop()
 
-with col_refresh:
-    # Disable button if refresh is already in progress
-    refresh_disabled = st.session_state.get("refresh_in_progress", False)
-    if st.button(
-        "Refresh Data Now",
-        use_container_width=True,
-        help="Manually fetch latest data from Polymarket API. Takes 5-10 minutes.",
-        disabled=refresh_disabled
-    ):
-        trigger_data_refresh()
-
-with col_status:
-    refresh_status, status_color = get_refresh_status()
-    st.markdown(f"**{refresh_status}**")
-
-st.divider()
-
-# ============================================================================
-# ACTIVE FILTERS DISPLAY (STICKY AT TOP)
-# ============================================================================
-
-# Build active filters list
-active_filters = []
-
-# Category filter
-if selected_categories:
-    active_filters.append(f"{', '.join(selected_categories)}")
-
-# Favorites filter
-if show_favorites_only:
-    active_filters.append("Favorites Only")
-
-# Open Interest filter
-if min_open_interest > 50_000:
-    active_filters.append(f"Min OI: {format_oi(min_open_interest)}")
-
-# Probability filter
-if prob_min > 0 or prob_max < 100:
-    active_filters.append(f"Probability: {prob_min}%-{prob_max}%")
-
-# Timeline filter
-if time_bucket != "All Markets":
-    active_filters.append(f"{time_bucket}")
-
-# Display filter summary prominently if any filters are active
-if active_filters:
-    col_filters, col_clear = st.columns([4, 0.6])
-    with col_filters:
-        st.markdown(f"### Active Filters: {' • '.join(active_filters)}")
-    with col_clear:
-        if st.button("✕ Clear All", key="clear_filters_top", help="Reset all filters to defaults"):
-            st.session_state.selected_categories = []
-            st.session_state.show_favorites = False
-            st.rerun()
+# Sidebar filters
+with st.sidebar:
+    st.header("🎚️ Filters")
     st.divider()
+    
+    # Categories
+    available_categories = sorted(df['category'].unique().tolist()) if 'category' in df.columns else []
+    selected_categories = st.multiselect("Market Categories", available_categories, default=[])
+    st.divider()
+    
+    # Watchlist
+    show_favorites_only = st.checkbox("Show Favorites Only", value=False)
+    st.divider()
+    
+    # Overlapping markets (different terminology, same feature)
+    show_overlaps_only = st.checkbox("Show Overlapping Markets Only (appear on both platforms)", value=False)
+    st.divider()
+    
+    # OI threshold
+    max_oi = int(df['open_interest'].max()) if len(df) > 0 else 1_000_000_000
+    min_open_interest = st.slider("Minimum OI ($)", 50_000, max_oi, 50_000, format="$%d")
+    st.divider()
+    
+    # Probability range
+    prob_min, prob_max = st.slider("Probability Range (%)", 0, 100, (0, 100))
+    st.divider()
+
+# Define sort options (moved to main page)
+sort_options = {
+    "Open Interest (High to Low)": ("open_interest", False),
+    "Open Interest (Low to High)": ("open_interest", True),
+    "24h Volume (High to Low)": ("volume_24h", False),
+    "24h Volume (Low to High)": ("volume_24h", True),
+    "Total Volume (High to Low)": ("volume", False),
+    "Total Volume (Low to High)": ("volume", True),
+    "Liquidity (High to Low)": ("liquidity", False),
+    "Liquidity (Low to High)": ("liquidity", True),
+    "Probability (High to Low)": ("probability", False),
+    "Probability (Low to High)": ("probability", True),
+}
 
 # Apply filters
 df_filtered = df[
@@ -614,297 +217,266 @@ df_filtered = df[
     (df['probability'] <= prob_max)
 ].copy()
 
-# Apply category filter if selected
-if selected_categories and 'category' in df_filtered.columns:
+if selected_categories:
     df_filtered = df_filtered[df_filtered['category'].isin(selected_categories)]
 
-# Calculate days left for time filtering
-df_filtered['days_left'] = df_filtered['end_date'].apply(
-    lambda x: days_until(pd.to_datetime(x, utc=True).to_pydatetime()) if pd.notna(x) else 999
-)
-
-# CRITICAL FIX: Filter out resolved markets (end_date in past) before applying time window
-# This prevents old resolved markets from showing as "0 days"
-df_filtered = df_filtered[df_filtered['days_left'] >= 0]
-
-df_filtered = df_filtered[
-    (df_filtered['days_left'] >= time_min) &
-    (df_filtered['days_left'] <= time_max)
-]
-
-# Add market maturity category for display
-def get_maturity(days):
-    if days <= 1:
-        return "🔴 FINAL VERDICT"
-    elif days <= 7:
-        return "🟡 ACTIVE"
-    else:
-        return "🔵 SPECULATIVE"
-
-df_filtered['maturity'] = df_filtered['days_left'].apply(get_maturity)
-
-# Load user's watchlist
-user_watchlist = load_watchlist()
-
-# Apply favorites filter if enabled
+# Watchlist filter
 if show_favorites_only:
+    user_watchlist = load_watchlist()
     df_filtered = df_filtered[df_filtered['id'].isin(user_watchlist)]
 
-# ============================================================================
-# BUSINESS INSIGHTS SECTION
-# ============================================================================
+# Overlaps filter
+if show_overlaps_only:
+    df_filtered = df_filtered[df_filtered['duplicate_group_id'].notna()]
 
-st.subheader("Market Consensus Analysis")
+# Main content
+st.title("Business Prediction Market Intelligence")
+st.markdown("**Real-time consensus for strategic decision-making**")
 
+col_refresh, col_status = st.columns([2, 3])
+with col_refresh:
+    if st.button("Refresh Data", use_container_width=True):
+        import asyncio
+        from pipeline import find_duplicate_groups
+        from fetchers.polymarket_api import fetch_all_markets as fetch_polymarket
+        from fetchers.kalshi_api import fetch_all_markets as fetch_kalshi
+        
+        with st.spinner("Fetching data..."):
+            try:
+                async def fetch_both():
+                    pm, k = await asyncio.gather(fetch_polymarket(), fetch_kalshi(), return_exceptions=True)
+                    pm = pm if not isinstance(pm, Exception) else []
+                    k = k if not isinstance(k, Exception) else []
+                    for m in pm:
+                        m['source'] = 'polymarket'
+                    for m in k:
+                        m['source'] = 'kalshi'
+                    return pm + k
+                
+                markets = asyncio.run(fetch_both())
+                if markets:
+                    db = DatabaseManager()
+                    db.connect()
+                    db.init_schema()
+                    dup_groups = find_duplicate_groups(markets)
+                    db.insert_markets(markets, dup_groups)
+                    db.close()
+                    st.success(f"✅ {len(markets)} markets updated")
+                    st.rerun()
+                else:
+                    st.error("No markets fetched")
+            except Exception as e:
+                st.error(f"Failed: {e}")
+
+with col_status:
+    refresh_status, _ = get_refresh_status()
+    st.markdown(f"**{refresh_status}**")
+
+st.divider()
+
+# Metrics (filter-aware)
 col1, col2, col3, col4 = st.columns(4)
-
 with col1:
-    # High consensus markets (>70% or <30%)
-    high_consensus = (
-        (df_filtered['probability'] > 70) | 
-        (df_filtered['probability'] < 30)
-    ).sum()
-    st.metric(
-        "High Conviction",
-        high_consensus,
-        f"{high_consensus/len(df_filtered)*100 if len(df_filtered) > 0 else 0:.0f}% of markets",
-        help="Markets where experts strongly agree (>70% or <30%)"
-    )
-
+    high_consensus = ((df_filtered['probability'] > 70) | (df_filtered['probability'] < 30)).sum()
+    st.metric("High Conviction", high_consensus)
 with col2:
-    # Disagreement markets (40-60%)
-    disagreement = (
-        (df_filtered['probability'] > 40) & 
-        (df_filtered['probability'] < 60)
-    ).sum()
-    st.metric(
-        "Balanced View",
-        disagreement,
-        f"{disagreement/len(df_filtered)*100 if len(df_filtered) > 0 else 0:.0f}% of markets",
-        help="Markets where experts are divided (40-60%)"
-    )
-
+    overlapping = df_filtered[df_filtered['duplicate_group_id'].notna()].shape[0]
+    st.metric("Overlapping Markets", overlapping)
 with col3:
-    # Imminent resolutions (<7 days)
-    imminent = (df_filtered['days_left'] < 7).sum()
-    st.metric(
-        "Resolutions This Week",
-        imminent,
-        f"{imminent/len(df_filtered)*100 if len(df_filtered) > 0 else 0:.0f}% of markets",
-        help="Markets with <7 days to resolution"
-    )
-
+    high_liquidity = (df_filtered['liquidity'] > df_filtered['liquidity'].quantile(0.75)).sum() if 'liquidity' in df_filtered.columns else 0
+    st.metric("High Liquidity", high_liquidity)
 with col4:
-    # High liquidity markets
-    high_liquidity_threshold = df_filtered['open_interest'].quantile(0.75)
-    high_liq = (df_filtered['open_interest'] > high_liquidity_threshold).sum()
-    st.metric(
-        "Highly Liquid",
-        high_liq,
-        f"Top 25% OI",
-        help="Markets with best price discovery"
-    )
+    st.metric("Total Markets", len(df_filtered))
 
 st.divider()
 
-# ============================================================================
-# QUICK BROWSE FILTERS - CONSOLIDATED MARKET DISCOVERY
-# ============================================================================
+# Sorting and pagination controls
+col_sort, col_view = st.columns([2, 1])
+with col_sort:
+    sort_by_label = st.selectbox("Sort By", list(sort_options.keys()), index=0)
+    sort_column, sort_ascending = sort_options[sort_by_label]
 
-st.subheader("Market Discovery")
-
-browse_col1, browse_col2 = st.columns(2)
-
-with browse_col1:
-    if st.button("Strongest Consensus", use_container_width=True, 
-                help="Markets where experts strongly agree (>80% or <20% probability)"):
-        st.session_state.quick_filter = "consensus"
-
-with browse_col2:
-    if st.button("Markets in Flux", use_container_width=True,
-                help="High disagreement = high risk/reward opportunities (40-60% probability)"):
-        st.session_state.quick_filter = "balanced"
-
-# Apply quick filter if selected
-quick_filter = st.session_state.get('quick_filter', None)
-if quick_filter == "consensus":
-    df_filtered = df_filtered[
-        (df_filtered['probability'] > 80) | 
-        (df_filtered['probability'] < 20)
-    ].sort_values('open_interest', ascending=False)
-elif quick_filter == "balanced":
-    df_filtered['distance_from_50'] = abs(df_filtered['probability'] - 50)
-    df_filtered = df_filtered.nsmallest(len(df_filtered), 'distance_from_50')
+# Pagination
+if 'markets_per_page' not in st.session_state:
+    st.session_state.markets_per_page = 20
+if 'current_page' not in st.session_state:
+    st.session_state.current_page = 1
 
 st.divider()
 
-# ============================================================================
-# DETAILED MARKET ANALYSIS
-# ============================================================================
+# Market list
+df_filtered_sorted = df_filtered.sort_values(sort_column, ascending=sort_ascending).reset_index(drop=True)
+total_markets = len(df_filtered_sorted)
 
-st.subheader(f"Market Details ({len(df_filtered)} markets)")
+# Load watchlist once for all cards
+user_watchlist = load_watchlist()
 
-if len(df_filtered) == 0:
-    st.info("No markets match your filters. Try adjusting the thresholds above.")
+# Check if showing overlaps only
+showing_overlaps_only = show_overlaps_only and len(df_filtered_sorted) > 0
+
+if showing_overlaps_only:
+    # Filter to ONLY groups with markets from BOTH platforms (true overlaps)
+    # First, exclude markets with no overlap group ID
+    df_with_overlaps = df_filtered_sorted[pd.notna(df_filtered_sorted['duplicate_group_id'])]
+    
+    if len(df_with_overlaps) == 0:
+        st.info("No overlapping markets found.")
+    else:
+        grouped = df_with_overlaps.groupby('duplicate_group_id')
+        true_overlaps = []
+        for group_id, group_markets in grouped:
+            sources = group_markets['source'].unique()
+            # Only include groups with markets from BOTH Polymarket AND Kalshi
+            if len(sources) >= 2 and 'polymarket' in [s.lower() for s in sources] and 'kalshi' in [s.lower() for s in sources]:
+                true_overlaps.append(group_id)
+        
+        if len(true_overlaps) == 0:
+            st.info("No overlapping markets found between platforms.")
+        else:
+            # Filter dataframe to only true overlaps
+            df_overlaps_only = df_with_overlaps[df_with_overlaps['duplicate_group_id'].isin(true_overlaps)]
+            grouped = df_overlaps_only.groupby('duplicate_group_id')
+            total_groups = len(grouped)
+            
+            # Pagination for groups
+            total_pages = (total_groups + st.session_state.markets_per_page - 1) // st.session_state.markets_per_page
+            start_idx = (st.session_state.current_page - 1) * st.session_state.markets_per_page
+            end_idx = min(start_idx + st.session_state.markets_per_page, total_groups)
+            
+            st.subheader(f"Overlapping Markets ({total_groups} groups) | Page {st.session_state.current_page}/{total_pages}")
+            
+            # Display groups for current page
+            group_list = list(grouped.groups.keys())
+            for group_idx in range(start_idx, end_idx):
+                group_id = group_list[group_idx]
+                group_markets = grouped.get_group(group_id).reset_index(drop=True)
+                
+                with st.container(border=True):
+                    # Side-by-side comparison of platforms (with questions)
+                    platform_cols = st.columns(len(group_markets))
+                    
+                    for col_idx, (_, market) in enumerate(group_markets.iterrows()):
+                        with platform_cols[col_idx]:
+                            source = market['source'].capitalize()
+                            source_color = "#f97316" if source == "Kalshi" else "#3b82f6"
+                            
+                            # Platform header
+                            st.markdown(f"<div style='background-color: {source_color}; color: white; padding: 8px; border-radius: 4px; text-align: center; font-weight: bold;'>{source}</div>", unsafe_allow_html=True)
+                            
+                            # Question text
+                            st.caption(f"**{market['question']}**")
+                            st.divider()
+                            
+                            # Probability
+                            prob = market['probability']
+                            prob_color = "#2ecc71" if prob >= 50 else "#e74c3c"
+                            st.markdown(f"<div style='background-color: {prob_color}; color: white; padding: 8px; border-radius: 3px; text-align: center; margin: 8px 0; font-weight: bold;'>{prob:.0f}%</div>", unsafe_allow_html=True)
+                            
+                            # Details
+                            st.caption(f"OI: {format_oi(market['open_interest'])}")
+                            st.caption(f"24h Vol: {format_oi(market['volume_24h'])}")
+                            liq = market.get('liquidity', 0)
+                            st.caption(f"Liq: {format_oi(liq) if liq else '$0'}")
+                            
+                            # Watchlist button
+                            in_watchlist = market['id'] in user_watchlist
+                            if in_watchlist:
+                                if st.button("❤️", key=f"watch_{market['id']}", help="Remove from watchlist"):
+                                    remove_from_watchlist(market['id'])
+                                    st.rerun()
+                            else:
+                                if st.button("🤍", key=f"watch_{market['id']}", help="Add to watchlist"):
+                                    add_to_watchlist(market['id'])
+                                    st.rerun()
+            
+            # Pagination controls for groups
+            st.divider()
+            col_prev, col_page, col_next = st.columns([1, 2, 1])
+            with col_prev:
+                if st.button("← Previous", disabled=(st.session_state.current_page == 1)):
+                    st.session_state.current_page -= 1
+                    st.rerun()
+            with col_page:
+                page_num = st.number_input("Go to page", min_value=1, max_value=total_pages, value=st.session_state.current_page)
+                st.session_state.current_page = page_num
+            with col_next:
+                if st.button("Next →", disabled=(st.session_state.current_page == total_pages)):
+                    st.session_state.current_page += 1
+                    st.rerun()
+
 else:
-    # Sort options - right-aligned with controls
-    sort_col1, sort_col2 = st.columns([4, 1])
+    # Normal view: show each market individually
+    # Normal view: show each market individually
+    total_pages = (total_markets + st.session_state.markets_per_page - 1) // st.session_state.markets_per_page
+    start_idx = (st.session_state.current_page - 1) * st.session_state.markets_per_page
+    end_idx = min(start_idx + st.session_state.markets_per_page, total_markets)
     
-    with sort_col1:
-        # Display count and pagination info
-        remaining = len(df_filtered) - st.session_state.markets_to_show
-        if remaining > 0:
-            st.caption(f"Showing {min(st.session_state.markets_to_show, len(df_filtered))} of {len(df_filtered)} markets (+ {remaining} more)")
-        else:
-            st.caption(f"Showing all {len(df_filtered)} markets")
+    st.subheader(f"Markets ({total_markets}) | Page {st.session_state.current_page}/{total_pages}")
     
-    with sort_col2:
-        # Sort selector dropdown
-        sort_option = st.selectbox(
-            "Sort by",
-            options=[
-                "Highest Open Interest",
-                "Most Likely",
-                "Least Likely",
-                "Resolving Soonest",
-                "Lowest Open Interest"
-            ],
-            index=0,
-            key="market_sort_selector",
-            help="Rank markets by different factors for decision-making"
-        )
-    
-    # Apply sorting based on selection
-    if sort_option == "Highest Open Interest":
-        df_filtered = df_filtered.sort_values('open_interest', ascending=False)
-    elif sort_option == "Most Likely":
-        df_filtered = df_filtered.sort_values('probability', ascending=False)
-    elif sort_option == "Least Likely":
-        df_filtered = df_filtered.sort_values('probability', ascending=True)
-    elif sort_option == "Resolving Soonest":
-        df_filtered = df_filtered.sort_values('end_date', ascending=True)
-    elif sort_option == "Lowest Open Interest":
-        df_filtered = df_filtered.sort_values('open_interest', ascending=True)
-    
-    # Market cards with business focus
-    for idx, (_, row) in enumerate(df_filtered.iterrows()):
-        # Stop rendering after pagination limit
-        if idx >= st.session_state.markets_to_show:
-            break
-        prices = parse_json_field(row['outcome_prices'])
-        outcomes = parse_json_field(row['outcomes'])
-        
-        # Get category from database or infer from question
-        category_color = "#6b7280"  # Default gray
-        if pd.notna(row.get('category')):
-            category = row['category']
-        else:
-            question_lower = row['question'].lower()
-            if any(word in question_lower for word in ['bitcoin', 'ethereum', 'crypto', 'xrp', 'solana', 'doge']):
-                category = "Crypto"
-                category_color = "#f97316"  # Orange
-            elif any(word in question_lower for word in ['trump', 'biden', 'election', 'congress', 'senate', 'democrat', 'republican', 'president']):
-                category = "Politics"
-                category_color = "#a855f7"  # Purple
-            elif any(word in question_lower for word in ['fed', 'interest rate', 'inflation', 'recession', 'gdp', 'unemployment', 'economy', 'stock', 'dow', 'nasdaq', 's&p']):
-                category = "Finance"
-                category_color = "#eab308"  # Gold
-            elif any(word in question_lower for word in ['ai', 'llm', 'openai', 'google', 'meta', 'apple', 'microsoft', 'tech', 'software']):
-                category = "Tech"
-                category_color = "#22c55e"  # Green
-            elif any(word in question_lower for word in ['war', 'conflict', 'russia', 'ukraine', 'israel', 'international']):
-                category = "Geopolitics"
-                category_color = "#ef4444"  # Red
-            else:
-                category = "Other"
-                category_color = "#6b7280"  # Gray
-        
-        # Check if in watchlist
+    # Display markets for current page
+    for idx in range(start_idx, end_idx):
+        row = df_filtered_sorted.iloc[idx]
         in_watchlist = row['id'] in user_watchlist
         
-        # Determine conviction level based on probability
-        prob = row['probability']
+        # Check if market has overlaps
+        has_overlaps = pd.notna(row['duplicate_group_id'])
         
-        # Compact horizontal market card - ONE LINE layout
         with st.container(border=True):
-            col_prob, col_question, col_oi, col_days, col_watch = st.columns([0.7, 3.5, 1.2, 0.6, 0.8], gap="small")
+            # Header: Probability + Question + Overlap indicator
+            col_prob, col_q, col_overlap = st.columns([0.6, 3.5, 0.7])
             
             with col_prob:
-                # LARGE PROBABILITY - Primary focal point
-                prob_color = "#2ecc71" if prob >= 50 else "#e74c3c"  # Green for YES, Red for NO
-                st.markdown(
-                    f"<div style='background-color: {prob_color}; padding: 8px 4px; border-radius: 4px; text-align: center; font-size: 20px; font-weight: bold; color: white;'>"
-                    f"{prob:.0f}%</div>",
-                    unsafe_allow_html=True
-                )
-                # Category badge with color - darker background for visibility on dark theme
-                st.markdown(
-                    f"<div style='background-color: {category_color}80; color: white; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; text-align: center; margin-top: 4px;'>"
-                    f"{category}</div>",
-                    unsafe_allow_html=True
-                )
+                prob = row['probability']
+                color = "#2ecc71" if prob >= 50 else "#e74c3c"
+                st.markdown(f"<div style='background-color: {color}; padding: 8px; border-radius: 4px; text-align: center; color: white; font-weight: bold;'>{prob:.0f}%</div>", unsafe_allow_html=True)
             
-            with col_question:
-                # Market question - expandable for long names
-                question_text = row['question']
-                question_text = question_text.replace('**', '').replace(':help[', '').replace(']', '')
-                question_short = question_text[:70] + "..." if len(question_text) > 70 else question_text
-                with st.expander(question_short, expanded=False):
-                    st.caption(question_text)
+            with col_q:
+                st.caption(row['question'])  # Full question, no truncation
+            
+            with col_overlap:
+                if has_overlaps:
+                    st.markdown(f"<div style='background-color: #9333ea; color: white; padding: 4px 8px; border-radius: 3px; font-size: 11px; text-align: center; font-weight: bold;'>🔗 Overlap</div>", unsafe_allow_html=True)
+            
+            # Details row
+            col_source, col_vol_24h, col_oi, col_liq, col_watch = st.columns([0.9, 1, 1, 1, 0.7])
+            
+            with col_source:
+                source = row['source'].capitalize() if pd.notna(row['source']) else "Unknown"
+                source_color = "#f97316" if source == "Kalshi" else "#3b82f6"
+                st.markdown(f"<div style='background-color: {source_color}; color: white; padding: 4px 8px; border-radius: 3px; font-size: 11px; text-align: center;'>{source}</div>", unsafe_allow_html=True)
+            
+            with col_vol_24h:
+                st.caption(f"24h Vol: {format_oi(row['volume_24h'])}")
             
             with col_oi:
-                # Open Interest - compact
-                st.caption(format_oi(row['open_interest']))
+                st.caption(f"OI: {format_oi(row['open_interest'])}")
             
-            with col_days:
-                # Days until resolution - compact
-                end_dt = pd.to_datetime(row['end_date'], utc=True).to_pydatetime()
-                days = days_until(end_dt)
-                days_str = f"{days}d" if days is not None else "∞"
-                st.caption(f"{days_str}")
+            with col_liq:
+                liq = row.get('liquidity', 0)
+                st.caption(f"Liq: {format_oi(liq) if liq else '$0'}")
             
             with col_watch:
-                # Watchlist button - always visible, no expansion needed
                 if in_watchlist:
-                    if st.button("❤️", key=f"watch_{row['id']}", 
-                                help="Remove from your watchlist"):
+                    if st.button("❤️", key=f"watch_{row['id']}", help="Remove from watchlist"):
                         remove_from_watchlist(row['id'])
                         st.rerun()
                 else:
-                    if st.button("🤍", key=f"watch_{row['id']}",
-                                help="Add to your watchlist"):
+                    if st.button("🤍", key=f"watch_{row['id']}", help="Add to watchlist"):
                         add_to_watchlist(row['id'])
                         st.rerun()
-            
-            
-    # Sticky Load More button - always accessible
-    if st.session_state.markets_to_show < len(df_filtered):
-        remaining = len(df_filtered) - st.session_state.markets_to_show
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            if st.button(f"Load {min(PAGINATION_SIZE, remaining)} More Markets", 
-                        use_container_width=True, key="load_more",
-                        help=f"{remaining} markets remaining"):
-                st.session_state.markets_to_show += PAGINATION_SIZE
-                st.rerun()
-    else:
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            st.caption("All markets loaded", help="You've reached the end of the filtered results")
-
-st.divider()
-
-# Enhanced footer with meaningful stats and refresh status
-f1, f2, f3, f4 = st.columns(4)
-with f1:
-    st.metric("Total Markets", len(df), delta=None, label_visibility="collapsed")
-with f2:
-    liquid_count = len(df[df['open_interest'] > 50000])
-    st.metric("Highly Liquid", liquid_count, label_visibility="collapsed")
-with f3:
-    high_conviction = len(df[(df['probability'] > 80) | (df['probability'] < 20)])
-    st.metric("High Conviction", high_conviction, label_visibility="collapsed")
-with f4:
-    refresh_status, _ = get_refresh_status()
-    st.caption(refresh_status)
+    
+    # Pagination controls
+    st.divider()
+    col_prev, col_page, col_next = st.columns([1, 2, 1])
+    with col_prev:
+        if st.button("← Previous", disabled=(st.session_state.current_page == 1)):
+            st.session_state.current_page -= 1
+            st.rerun()
+    with col_page:
+        page_num = st.number_input("Go to page", min_value=1, max_value=total_pages, value=st.session_state.current_page)
+        st.session_state.current_page = page_num
+    with col_next:
+        if st.button("Next →", disabled=(st.session_state.current_page == total_pages)):
+            st.session_state.current_page += 1
+            st.rerun()
 

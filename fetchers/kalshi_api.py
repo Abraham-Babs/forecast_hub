@@ -1,14 +1,14 @@
 import httpx
 import asyncio
 import logging
-import config as cfg
+from fetchers import config as cfg
 
-logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
 
-async def stream_markets(client: httpx.AsyncClient):
-    """Stream markets as they're fetched and filtered. Yields dicts one by one."""
+async def fetch_all_pages(client: httpx.AsyncClient) -> list[dict]:
+    """Fetch all paginated results sequentially (API constraint) and return complete list."""
+    all_markets = []
     cursor = None
     fetched_count = 0
     
@@ -39,16 +39,16 @@ async def stream_markets(client: httpx.AsyncClient):
                 if market.get('open_interest', 0) >= cfg.KALSHI_MIN_OPEN_INTEREST:
                     batch_count += 1
                     fetched_count += 1
-                    yield {
+                    all_markets.append({
                         'id': market.get('ticker'),
                         'question': market.get('title'),
                         'probability': float(market.get('last_price', 0)),
                         'volume': market.get('volume', 0),
                         'volume_24h': market.get('volume_24h', 0),
                         'liquidity': float(market.get('liquidity_dollars', 0)),
-                        'open_interest': market.get('open_interest'),
+                        'open_interest': float(market.get('open_interest', 0)),
                         'category': event_category
-                    }
+                    })
         
         if batch_count > 0:
             logger.info(f"Batch: {batch_count} markets | Total: {fetched_count}")
@@ -58,10 +58,16 @@ async def stream_markets(client: httpx.AsyncClient):
             break
     
     logger.info(f"Kalshi: {fetched_count} markets (OI >= ${cfg.KALSHI_MIN_OPEN_INTEREST:,})")
+    return all_markets
+
+
+async def stream_markets(client: httpx.AsyncClient):
+    """Deprecated: use fetch_all_pages() directly. Kept for backward compatibility."""
+    return await fetch_all_pages(client)
 
 
 async def fetch_all_markets() -> list[dict]:
-    """Fetch all markets with streaming. Caller can process concurrently."""
+    """Fetch all markets from Kalshi API with pagination."""
     connector = httpx.AsyncHTTPTransport(limits=httpx.Limits(
         max_connections=cfg.API_RATE_LIMIT_TOTAL,
         max_keepalive_connections=cfg.API_RATE_LIMIT_PER_HOST
@@ -69,8 +75,7 @@ async def fetch_all_markets() -> list[dict]:
     
     try:
         async with httpx.AsyncClient(transport=connector, timeout=cfg.KALSHI_TIMEOUT) as client:
-            # Collect streamed markets; caller can also iterate async generator directly
-            return [market async for market in stream_markets(client)]
+            return await fetch_all_pages(client)
     except asyncio.TimeoutError:
         logger.error(f"Kalshi fetch timeout after {cfg.KALSHI_TIMEOUT}s")
     except httpx.HTTPError as e:
