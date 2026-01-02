@@ -68,10 +68,13 @@ async def stream_markets(client: httpx.AsyncClient):
 
 async def fetch_all_markets() -> list[dict]:
     """Fetch all markets from Kalshi API with pagination."""
-    connector = httpx.AsyncHTTPTransport(limits=httpx.Limits(
-        max_connections=cfg.API_RATE_LIMIT_TOTAL,
-        max_keepalive_connections=cfg.API_RATE_LIMIT_PER_HOST
-    ))
+    connector = httpx.AsyncHTTPTransport(
+        limits=httpx.Limits(
+            max_connections=cfg.API_RATE_LIMIT_TOTAL,
+            max_keepalive_connections=cfg.API_RATE_LIMIT_PER_HOST
+        ),
+        http2=True
+    )
     
     try:
         async with httpx.AsyncClient(transport=connector, timeout=cfg.KALSHI_TIMEOUT) as client:

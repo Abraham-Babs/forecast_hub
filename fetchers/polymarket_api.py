@@ -20,7 +20,8 @@ async def fetch_markets(client: httpx.AsyncClient, tag_id: int) -> list:
                     "closed": cfg.POLYMARKET_CLOSED,
                     "tag_id": tag_id,
                     "volume_num_min": cfg.POLYMARKET_VOLUME_NUM_MIN,
-                    "liquidity_num_min": cfg.POLYMARKET_LIQUIDITY_NUM_MIN
+                    "liquidity_num_min": cfg.POLYMARKET_LIQUIDITY_NUM_MIN,
+                    "active": cfg.POLYMARKET_ACTIVE
                 },
                 timeout=httpx.Timeout(cfg.HTTP_TIMEOUT)
             )
@@ -103,7 +104,7 @@ async def process_market(
             "volume_24h": float(market.get("volume24hr", 0)),
             "open_interest": oi,
             "category": category,
-            "liquidity": float(market.get("liquidity", 0)),
+            "liquidity": float(market.get("liquidity") or market.get("liquidityNum", 0)),
         }
     except Exception:
         return None
@@ -111,10 +112,13 @@ async def process_market(
 
 async def fetch_all_markets() -> list[dict]:
     """Fetch and process markets from all categories with streaming."""
-    connector = httpx.AsyncHTTPTransport(limits=httpx.Limits(
-        max_connections=cfg.API_RATE_LIMIT_TOTAL,
-        max_keepalive_connections=cfg.API_RATE_LIMIT_PER_HOST
-    ))
+    connector = httpx.AsyncHTTPTransport(
+        limits=httpx.Limits(
+            max_connections=cfg.API_RATE_LIMIT_TOTAL,
+            max_keepalive_connections=cfg.API_RATE_LIMIT_PER_HOST
+        ),
+        http2=True
+    )
     
     async with httpx.AsyncClient(transport=connector, timeout=cfg.HTTP_TIMEOUT) as client:
         # Create all fetch tasks upfront

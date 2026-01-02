@@ -16,6 +16,7 @@ POLYMARKET_CLOSED = "false"   #Fetch only active markets
 POLYMARKET_VOLUME_NUM_MIN = 500000 #Volume minimum threshold
 POLYMARKET_LIQUIDITY_NUM_MIN = 0 #Liquidity minimum threshold (disabled)
 POLYMARKET_OI_MIN = 200000 #Open Interest minimum threshold
+POLYMARKET_ACTIVE = "true" #Fetch only active markets
 
 HTTP_TIMEOUT = 10.0 #Timeout for HTTP requests
 OI_TIMEOUT = 10.0   #Timeout for Open Interest requests
