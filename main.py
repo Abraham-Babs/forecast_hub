@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Polymarket BI - Entry Point
+Forecast Hub - Entry Point
 Validates configuration, fetches market data from Polymarket and Kalshi APIs concurrently, then launches dashboard.
 Both APIs fetched concurrently; failures are handled gracefully with cache fallback.
 """

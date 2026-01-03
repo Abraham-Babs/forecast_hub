@@ -1,8 +1,8 @@
-# Polymarket BI
+# Forecast Hub
 
 **Harness collective Human intelligence to inform strategic business decisions**
 
-*For business strategists, product managers, risk managers, and researchers.*
+*For business strategists, product managers, risk managers, traders, researchers, analysts, etc.*
 
 Fetch prediction market data from Polymarket and Kalshi, detect overlapping markets across platforms (85% question similarity), and explore via interactive dashboard. No blockchain knowledge required.
 
@@ -27,10 +27,30 @@ Dashboard launches at `http://localhost:8501`. Data fetches on startup; click "R
 
 ## Installation
 
+### Prerequisites
+- Git installed ([download here](https://git-scm.com/))
+- Python 3.10+ installed ([download here](https://www.python.org/))
+- `uv` package manager ([install guide](https://docs.astral.sh/uv/getting-started/installation/))
+
+### Setup & Run
+
+**macOS / Linux:**
 ```bash
-uv sync                 # Install dependencies
-uv run main.py          # Launch dashboard at http://localhost:8501
+git clone <your-repo-url>
+cd forecast-hub
+uv sync
+uv run main.py
 ```
+
+**Windows (PowerShell):**
+```powershell
+git clone <your-repo-url>
+cd forecast-hub
+uv sync
+uv run main.py
+```
+
+Done. Dashboard opens at `http://localhost:8501`.
 
 ## Configuration
 
@@ -67,7 +87,7 @@ polymarket/
 │   ├── polymarket_api.py   # Polymarket client
 │   └── kalshi_api.py       # Kalshi client
 ├── pyproject.toml          # Dependencies
-└── polymarket_bi.db        # SQLite (auto-created)
+└── Markets_database.db     # SQLite (auto-created)
 ```
 
 ## How It Works
@@ -101,8 +121,11 @@ polymarket/
 - `httpx` — Async HTTP
 - `pandas` — Data manipulation
 - `streamlit` — Dashboard
-- `python-dotenv` — Config
 
 See `pyproject.toml` for full list.
+
+## Dashboard Quick Reference
+
+A **Quick Reference** guide is available in the dashboard sidebar (📖 expand to see platform badges, probability colors, metric definitions, icons, and filter explanations).
 
 

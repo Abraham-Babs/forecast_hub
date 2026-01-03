@@ -13,7 +13,7 @@ from db_utils import retry_on_db_lock
 from db_manager import DatabaseManager
 
 st.set_page_config(
-    page_title="Polymarket BI",
+    page_title="Forecast Hub",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -54,7 +54,7 @@ h1, h2, h3, h4, h5, h6 { margin: 0 !important; padding: 0.2rem 0 !important; lin
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-DATABASE_PATH = os.getenv("DATABASE_PATH", "polymarket_bi.db")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "Markets_database.db")
 
 # Theme colors
 COLORS = {
@@ -310,6 +310,20 @@ with st.sidebar:
     
     # Probability range
     prob_min, prob_max = st.slider("Probability Range (%)", 0, 100, (0, 100))
+    st.divider()
+    
+    # Quick Reference
+    with st.expander("📖 Quick Reference", expanded=False):
+        st.markdown("**Platform Badges:**")
+        st.markdown(f"<span style='background-color: {COLORS['polymarket']}; color: white; padding: 3px 6px; border-radius: 2px; font-size: 0.85rem;'>Polymarket</span> | <span style='background-color: {COLORS['kalshi']}; color: white; padding: 3px 6px; border-radius: 2px; font-size: 0.85rem;'>Kalshi</span>", unsafe_allow_html=True)
+        st.markdown("**Probability Colors:** Red (unlikely) → Green (likely)")
+        st.markdown("**Metrics:**")
+        st.markdown("- **OI:** Open Interest (market depth)")
+        st.markdown("- **Volume:** Total/24h trading activity")
+        st.markdown("- **Liquidity:** Market maker depth")
+        st.markdown("**Icons:**")
+        st.markdown("- **❤️ / 🤍:** Add/remove from favorites")
+        st.markdown("- **🔗 Overlap:** View matching market on other platform")
 
 # Apply filters
 df_filtered = df[

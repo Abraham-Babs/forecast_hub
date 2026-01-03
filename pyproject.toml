@@ -1,12 +1,11 @@
 [project]
-name = "polymarket"
+name = "forecast-hub"
 version = "0.1.0"
-description = "Polymarket Business Intelligence Dashboard"
+description = "Forecast Hub — Aggregate prediction market data from Polymarket and Kalshi, detect cross-platform overlaps, and explore collective market consensus via interactive dashboard."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.27.0",
-    "requests>=2.31.0",
     "pandas>=2.1.0",
     "streamlit>=1.28.0",
     "python-dotenv>=1.0.0",

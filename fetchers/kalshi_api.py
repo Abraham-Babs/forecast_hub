@@ -61,11 +61,6 @@ async def fetch_all_pages(client: httpx.AsyncClient) -> list[dict]:
     return all_markets
 
 
-async def stream_markets(client: httpx.AsyncClient):
-    """Deprecated: use fetch_all_pages() directly. Kept for backward compatibility."""
-    return await fetch_all_pages(client)
-
-
 async def fetch_all_markets() -> list[dict]:
     """Fetch all markets from Kalshi API with pagination."""
     connector = httpx.AsyncHTTPTransport(

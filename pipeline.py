@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 # Configuration
-DATABASE_PATH = os.getenv("DATABASE_PATH", "polymarket_bi.db")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "Markets_database.db")
 
 
 def find_duplicate_groups(markets: list, threshold: float = 0.85) -> dict:

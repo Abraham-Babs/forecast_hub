@@ -12,7 +12,7 @@ from db_utils import retry_on_db_lock
 
 logger = logging.getLogger(__name__)
 
-DATABASE_PATH = os.getenv("DATABASE_PATH", "polymarket_bi.db")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "Markets_database.db")
 
 
 class DatabaseManager:
