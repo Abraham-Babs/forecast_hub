@@ -337,8 +337,8 @@ if show_overlaps_only:
     df_filtered = df_filtered[df_filtered['duplicate_group_id'].notna()]
 
 # Main content
-st.title("Business Prediction Market Intelligence")
-st.markdown("**Real-time consensus for strategic decision-making**")
+st.title("Market Consensus Intelligence")
+st.markdown("**Harness collective Human intelligence to inform strategic business decisions**")
 
 col_refresh, col_status = st.columns([2, 3])
 with col_refresh:
