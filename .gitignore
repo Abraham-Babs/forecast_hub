@@ -50,5 +50,5 @@ Markets_database.db
 .streamlit/
 
 # uv lock file (optional - can be committed)
-# uv.lock
+uv.lock
 .github
