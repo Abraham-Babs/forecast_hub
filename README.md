@@ -35,18 +35,10 @@ Feel free to modify and extend the functionality of this tool, to suit your need
 
 ### Setup & Run
 
-**macOS / Linux:**
+**macOS / Linux / Windows (PowerShell):**
 ```bash
-git clone <your-repo-url>
-cd forecast-hub
-uv sync
-uv run main.py
-```
-
-**Windows (PowerShell):**
-```powershell
-git clone <your-repo-url>
-cd forecast-hub
+git clone https://github.com/Abraham-Babs/Events_Forecaster.git
+cd Events_Forecaster
 uv sync
 uv run main.py
 ```
