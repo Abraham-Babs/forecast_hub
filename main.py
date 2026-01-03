@@ -27,7 +27,7 @@ def main():
     """
     
     print("\n" + "="*60)
-    print("POLYMARKET BUSINESS INTELLIGENCE")
+    print("BUSINESS INTELLIGENCE")
     print("="*60)
     
     # Fetch initial data
