@@ -1,4 +1,4 @@
-# Forecast Hub
+# Future Events Probability Dashboard
 
 **Harness collective Human intelligence to inform strategic business decisions**
 
