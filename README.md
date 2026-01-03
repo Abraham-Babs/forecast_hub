@@ -1,29 +1,30 @@
-# Forecast Hub
+# Future Events Probability Dashboard
 
 **Harness collective Human intelligence to inform strategic business decisions**
 
 *For business strategists, product managers, risk managers, traders, researchers, analysts, etc.*
 
-Fetch prediction market data from Polymarket and Kalshi, detect overlapping markets across platforms (85% question similarity), and explore via interactive dashboard. No blockchain knowledge required.
+Fetch prediction market data from Polymarket and Kalshi, output the probability of events based on markets trading prices on both a decentralised (Polymarket) and a regulated (Kalshi) platform.
 
-## Quick Start
+For a deeper understanding of each market, the dashboard also includes each market's current liquidity, total volume, past 24 hours traded volume, and Open interest, So you can see how traders react to new information.
 
-```bash
-uv sync
-uv run main.py
-```
+This tool also detect overlapping markets across platforms (85% question similarity).
 
-Dashboard launches at `http://localhost:8501`. Data fetches on startup; click "Refresh Data" for manual updates.
+## Important
+This tool assumes you have basic knowledge of what a prediction market is and how it works, if you dont, you should look it up.
+
+Markets probability can be wrong, and/or manipulated, so don't make them the sole information source that you base important decisions on.
+
+Feel free to modify and extend the functionality of this tool, to suit your needs.
 
 ## Features
 
 - **Dual-source data**: Polymarket (15 categories) + Kalshi (paginated events) fetched concurrently
 - **Cross-platform overlaps**: Automatic detection groups same markets across platforms
 - **Filtering & search**: By source, category, probability, open interest, watchlist
-- **Source badges**: Color-coded (Blue=Polymarket, Green=Kalshi)
 - **Side-by-side comparison**: View overlapping markets from both platforms
 - **Persistent watchlist**: Save favorite markets across sessions
-- **Manual & auto-refresh**: Dashboard button or configure via `fetchers/config.py`
+- **Manual refresh**: Dashboard button
 
 ## Installation
 
@@ -34,18 +35,10 @@ Dashboard launches at `http://localhost:8501`. Data fetches on startup; click "R
 
 ### Setup & Run
 
-**macOS / Linux:**
+**macOS / Linux / Windows (PowerShell):**
 ```bash
-git clone <your-repo-url>
-cd forecast-hub
-uv sync
-uv run main.py
-```
-
-**Windows (PowerShell):**
-```powershell
-git clone <your-repo-url>
-cd forecast-hub
+git clone https://github.com/Abraham-Babs/Events_Forecaster.git
+cd Events_Forecaster
 uv sync
 uv run main.py
 ```
