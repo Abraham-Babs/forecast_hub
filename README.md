@@ -37,8 +37,8 @@ Feel free to modify and extend the functionality of this tool, to suit your need
 
 **macOS / Linux / Windows (PowerShell):**
 ```bash
-git clone https://github.com/Abraham-Babs/Events_Forecaster.git
-cd Events_Forecaster
+git clone https://github.com/Abraham-Babs/kalshpoly_BI.git
+cd kalshpoly_BI
 uv sync
 uv run main.py
 ```
