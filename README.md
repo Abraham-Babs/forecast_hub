@@ -90,6 +90,15 @@ The system is deliberately lean. No microservices circus, no vector database blo
 
 ### Installation & Run
 
+**macOS / Linux / Windows (PowerShell):**
+```bash
+git clone https://github.com/Abraham-Babs/kalshpoly_BI.git
+cd kalshpoly_BI
+uv sync
+uv run main.py
+```
+
+Done. Dashboard opens at `http://localhost:8501`.
 1. **Clone the repository:**
    ```bash
    git clone https://github.com/Abraham-Babs/Forecast_Hub.git
