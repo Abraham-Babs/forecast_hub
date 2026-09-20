@@ -92,8 +92,8 @@ The system is deliberately lean. No microservices circus, no vector database blo
 
 **macOS / Linux / Windows (PowerShell):**
 ```bash
-git clone https://github.com/Abraham-Babs/kalshpoly_BI.git
-cd kalshpoly_BI
+git clone https://github.com/Abraham-Babs/forecast_hub.git
+cd forecast_hub
 uv sync
 uv run main.py
 ```
