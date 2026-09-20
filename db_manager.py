@@ -14,6 +14,37 @@ logger = logging.getLogger(__name__)
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "Markets_database.db")
 
+CATEGORY_MAPPING = {
+    "economy": "Economy & Macro",
+    "economics": "Economy & Macro",
+    "unemployment": "Economy & Macro",
+    "financial_forecast": "Economy & Macro",
+    "finance": "Finance & Markets",
+    "financials": "Finance & Markets",
+    "stocks": "Finance & Markets",
+    "banking": "Finance & Markets",
+    "market_cap": "Finance & Markets",
+    "politics": "Politics & Governance",
+    "elections": "Politics & Governance",
+    "business": "Companies & Business",
+    "business_news": "Companies & Business",
+    "companies": "Companies & Business",
+    "tech": "Technology & Science",
+    "science": "Technology & Science",
+    "science and technology": "Technology & Science",
+    "world": "Global Affairs",
+    "social": "Culture & Society",
+}
+
+
+def normalize_category(cat: str | None) -> str:
+    """Normalize raw API category strings into unified canonical taxonomy."""
+    if not cat:
+        return "General"
+    cleaned = cat.strip().lower()
+    return CATEGORY_MAPPING.get(cleaned, cleaned.replace("_", " ").title())
+
+
 
 class DatabaseManager:
     """SQLite database operations for markets, snapshots, and metadata. 
@@ -56,11 +87,12 @@ class DatabaseManager:
             )
         """)
         
-        # Markets table with source and duplicate grouping
+        # Markets table with source, topic title, and duplicate grouping
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS markets (
                 id TEXT PRIMARY KEY,
                 source TEXT NOT NULL,
+                topic_title TEXT,
                 question TEXT,
                 liquidity REAL,
                 volume REAL,
@@ -68,10 +100,35 @@ class DatabaseManager:
                 open_interest REAL,
                 probability REAL,
                 category TEXT,
+                end_date TEXT,
+                rules TEXT,
+                url TEXT,
                 duplicate_group_id INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Non-destructive migration: add new columns if table already existed
+        cursor.execute("PRAGMA table_info(markets)")
+        existing_cols = {row["name"] for row in cursor.fetchall()}
+        new_cols = {
+            "topic_title": "TEXT",
+            "end_date": "TEXT",
+            "rules": "TEXT",
+            "url": "TEXT"
+        }
+        for col_name, col_type in new_cols.items():
+            if col_name not in existing_cols:
+                cursor.execute(f"ALTER TABLE markets ADD COLUMN {col_name} {col_type}")
+                logger.info(f"Migrated markets table: added {col_name} ({col_type})")
+
+        # Standardize existing stored categories into canonical taxonomy
+        cursor.execute("SELECT DISTINCT category FROM markets WHERE category IS NOT NULL")
+        existing_categories = [row[0] for row in cursor.fetchall()]
+        for cat in existing_categories:
+            canonical = normalize_category(cat)
+            if canonical != cat:
+                cursor.execute("UPDATE markets SET category = ? WHERE category = ?", (canonical, cat))
         
         # Snapshots table
         cursor.execute("""
@@ -109,6 +166,7 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_markets_open_interest ON markets(open_interest)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_markets_source ON markets(source)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_markets_duplicate_group ON markets(duplicate_group_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_markets_topic_title ON markets(topic_title)")
         
         # Insert Polymarket source
         cursor.execute("""
@@ -118,12 +176,12 @@ class DatabaseManager:
         
         # Insert Kalshi source
         cursor.execute("""
-            INSERT OR IGNORE INTO sources (name, api_endpoint)
+            INSERT OR REPLACE INTO sources (name, api_endpoint)
             VALUES (?, ?)
-        """, ("Kalshi", "https://api.elections.kalshi.com"))
+        """, ("Kalshi", "https://external-api.kalshi.com/trade-api/v2"))
         
         self.conn.commit()
-        logger.info("Database schema initialized")
+        logger.info("Database schema initialized with migrations")
     
     @retry_on_db_lock(max_retries=3, initial_delay=0.1)
     def insert_markets(self, markets: list, duplicate_groups: dict) -> tuple:
@@ -162,27 +220,39 @@ class DatabaseManager:
                 dup_group = duplicate_groups.get(market_id)
                 
                 cursor.execute("""
-                    INSERT INTO markets (id, source, question, liquidity, volume, volume_24h, open_interest, probability, category, duplicate_group_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO markets (
+                        id, source, topic_title, question, liquidity, volume, volume_24h, 
+                        open_interest, probability, category, end_date, rules, url, duplicate_group_id
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         source = excluded.source,
+                        topic_title = excluded.topic_title,
+                        question = excluded.question,
                         liquidity = excluded.liquidity,
                         volume = excluded.volume,
                         volume_24h = excluded.volume_24h,
                         open_interest = excluded.open_interest,
                         probability = excluded.probability,
                         category = excluded.category,
+                        end_date = excluded.end_date,
+                        rules = excluded.rules,
+                        url = excluded.url,
                         duplicate_group_id = excluded.duplicate_group_id
                 """, (
                     market_id,
                     market.get("source", "unknown"),
+                    market.get("topic_title") or market.get("question"),
                     market.get("question"),
                     market.get("liquidity"),
                     market.get("volume"),
                     market.get("volume_24h"),
                     market.get("open_interest"),
                     market.get("probability"),
-                    market.get("category"),
+                    normalize_category(market.get("category")),
+                    market.get("end_date"),
+                    market.get("rules"),
+                    market.get("url"),
                     dup_group,
                 ))
                 
@@ -241,8 +311,8 @@ class DatabaseManager:
         try:
             cursor = self.conn.cursor()
             cursor.execute("""
-                SELECT id, question, liquidity, volume, 
-                       open_interest, probability, category
+                SELECT id, source, topic_title, question, liquidity, volume, volume_24h,
+                       open_interest, probability, category, end_date, rules, url, duplicate_group_id
                 FROM markets
                 ORDER BY open_interest DESC
             """)
@@ -257,3 +327,24 @@ class DatabaseManager:
         except sqlite3.Error as e:
             logger.error(f"Failed to load cached markets: {e}")
             return None
+
+    def get_market_count(self) -> int:
+        """Get total number of markets currently stored in the database."""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM markets")
+            row = cursor.fetchone()
+            return row[0] if row else 0
+        except Exception:
+            return 0
+
+    def get_last_refresh_time(self) -> str | None:
+        """Get timestamp of the last successful data refresh."""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT value FROM metadata WHERE key = 'last_refresh'")
+            row = cursor.fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
+

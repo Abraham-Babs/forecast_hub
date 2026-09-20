@@ -1,688 +1,1082 @@
 #!/usr/bin/env python
-"""Business Intelligence Dashboard - Streamlit interface for filtering and exploring markets from both Polymarket and Kalshi.
-Displays source attribution (color-coded badges) and allows filtering by duplicate status (cross-platform matches).
-Watchlist saved to database for persistence across sessions."""
+"""
+Forecast Hub - Decision Intelligence Dashboard
+Interactive interface for exploring collective market consensus from Polymarket and Kalshi.
+Designed from first principles for business executives and decision makers.
+"""
 
 import os
 import sqlite3
+import asyncio
+import threading
+import logging
+from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
-import logging
-from tz_utils import now_utc
-from db_utils import retry_on_db_lock
 from db_manager import DatabaseManager
-
-st.set_page_config(
-    page_title="Forecast Hub",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Compact CSS to reduce spacing
-st.markdown("""
-<style>
-/* Remove all padding/margins */
-.block-container { padding-top: 2rem !important; padding-bottom: 0 !important; margin: 0 !important; }
-.main { padding-top: 0 !important; }
-
-/* Headings - no space */
-h1, h2, h3, h4, h5, h6 { margin: 0 !important; padding: 0.2rem 0 !important; line-height: 1.2 !important; }
-
-/* Sidebar extreme compression */
-[data-testid="stSidebar"] { font-size: 0.8rem; }
-[data-testid="stSidebar"] h2 { margin: 0 !important; padding: 0 !important; font-size: 0.95rem !important; }
-[data-testid="stSidebar"] label { margin: 0 !important; padding: 0 !important; }
-[data-testid="stSidebar"] .stCheckbox, [data-testid="stSidebar"] .stRadio { margin: 0 !important; padding: 0 !important; }
-[data-testid="stSidebar"] .stSlider { margin: 0.15rem 0 !important; padding: 0 !important; }
-[data-testid="stSidebar"] .stExpander { margin: 0 !important; padding: 0 !important; }
-
-/* Remove element container padding */
-.element-container { margin: 0 !important; padding: 0 !important; }
-.stDivider { margin: 0.1rem 0 !important; }
-
-/* Market cards: defined borders */
-[data-testid="stContainer"] { 
-  border: 1.5px solid #e5e7eb !important; 
-  border-radius: 6px !important; 
-  padding: 0.6rem !important; 
-  margin: 0.3rem 0 !important; 
-}
-</style>
-""", unsafe_allow_html=True)
+from pipeline import main as run_pipeline
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "Markets_database.db")
 
-# Theme colors
-COLORS = {
-    "kalshi": "#10b981",  # Green - Kalshi brand color
-    "polymarket": "#3b82f6",  # Blue - Polymarket brand color
-    "probability_high": "#2ecc71",
-    "probability_low": "#e74c3c",
-    "liquidity": "#f59e0b",
-    "overlaps": "#9333ea",
-    "metric_value": "#64748b",
-    "metric_label": "#475569",
-}
+# Thread-safe background sync state
+_sync_thread: threading.Thread | None = None
+_sync_lock = threading.Lock()
 
-# Probability color bands (10% increments, red to green)
-PROBABILITY_BANDS = [
-    (10, "#991b1b"),   # 0-10%: dark red
-    (20, "#dc2626"),   # 10-20%: red
-    (30, "#ea580c"),   # 20-30%: orange-red
-    (40, "#ea8317"),   # 30-40%: orange
-    (50, "#eab308"),   # 40-50%: yellow-orange
-    (60, "#d4af37"),   # 50-60%: golden
-    (70, "#84cc16"),   # 60-70%: lime green
-    (80, "#22c55e"),   # 70-80%: green
-    (90, "#10b981"),   # 80-90%: emerald
-    (101, "#059669"),  # 90-100%: deep green
-]
 
-def get_probability_color(prob: float) -> str:
-    """Return color for probability value (0-100) using 10% bands."""
-    for threshold, color in PROBABILITY_BANDS:
-        if prob < threshold:
-            return color
-    return PROBABILITY_BANDS[-1][1]
+def is_sync_running() -> bool:
+    """Check if a background market sync is currently active."""
+    global _sync_thread
+    return _sync_thread is not None and _sync_thread.is_alive()
 
-def get_category_color(category: str) -> str:
-    """Return a consistent color for a category."""
-    category_colors = {
-        "politics": "#ef4444",
-        "economics": "#f97316",
-        "crypto": "#8b5cf6",
-        "science and tech": "#3b82f6",
-        "sports": "#ec4899",
-        "entertainment": "#d946ef",
-        "world": "#06b6d4",
-        "other": "#6b7280",
-    }
-    cat_lower = category.lower() if category else "other"
-    return category_colors.get(cat_lower, "#6b7280")
 
-# Cache watchlist in session to avoid repeated DB calls
-if 'watchlist_cache' not in st.session_state:
-    st.session_state.watchlist_cache = None
+def trigger_background_sync() -> bool:
+    """Start an asynchronous background thread to fetch market consensus."""
+    global _sync_thread
+    with _sync_lock:
+        if _sync_thread is None or not _sync_thread.is_alive():
+            def _worker():
+                try:
+                    logger.info("Background market sync started.")
+                    asyncio.run(run_pipeline())
+                    logger.info("Background market sync completed successfully.")
+                except Exception as ex:
+                    logger.error(f"Background market sync failed: {ex}")
 
-# Navigation state for overlap view
-if 'show_overlaps_view' not in st.session_state:
-    st.session_state.show_overlaps_view = False
-if 'navigate_to_group' not in st.session_state:
-    st.session_state.navigate_to_group = None
+            _sync_thread = threading.Thread(target=_worker, daemon=True)
+            _sync_thread.start()
+            return True
+        return False
 
-def format_oi(oi: float) -> str:
-    """Format market metric (OI, volume, liquidity) in human-readable K/M notation."""
-    if oi is None or oi == 0:
+st.set_page_config(
+    page_title="Forecast Hub",
+    page_icon="bar_chart",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+if 'dark_mode' not in st.session_state:
+    st.session_state.dark_mode = True
+
+
+def inject_theme_css(dark_mode: bool):
+    """Inject CSS for Day (Light) or Night (Dark) mode."""
+    if dark_mode:
+        theme_css = """
+        /* Night Mode Styling - Balanced & Refined Palette */
+        header[data-testid="stHeader"] {
+            background-color: transparent !important;
+        }
+        .stApp {
+            background-color: #14171f !important;
+            color: #e2e8f0 !important;
+        }
+        [data-testid="stSidebar"] {
+            background-color: #10131a !important;
+            border-right: 1px solid #222734 !important;
+        }
+        [data-testid="stSidebar"] * {
+            color: #cbd5e1 !important;
+        }
+        .status-pill {
+            background-color: #1b202c !important;
+            color: #94a3b8 !important;
+            border: 1px solid #293042 !important;
+        }
+        .forecast-card {
+            background: #1b202c !important;
+            border: 1px solid #282f40 !important;
+            box-shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.25) !important;
+        }
+        .forecast-card:hover {
+            border-color: #3b455c !important;
+            box-shadow: 0 6px 12px -2px rgba(0, 0, 0, 0.35) !important;
+        }
+        .topic-header {
+            background-color: #1b202c !important;
+            border-left: 4px solid #3b82f6 !important;
+        }
+        .topic-title {
+            color: #f1f5f9 !important;
+        }
+        .topic-subtitle {
+            color: #8b97ab !important;
+        }
+        .card-question {
+            color: #f1f5f9 !important;
+        }
+        .card-meta {
+            color: #8b97ab !important;
+        }
+        .metric-box {
+            background-color: #13161f !important;
+            border: 1px solid #222734 !important;
+        }
+        .metric-box-title {
+            color: #8b97ab !important;
+        }
+        .metric-box-val {
+            color: #f1f5f9 !important;
+        }
+        .comparison-container {
+            background: #1b202c !important;
+            border: 1px solid #282f40 !important;
+        }
+        .comparison-title {
+            color: #f1f5f9 !important;
+        }
+        .badge-kalshi {
+            background-color: #0c3325 !important;
+            color: #6ee7b7 !important;
+            border: 1px solid #13523c !important;
+        }
+        .badge-polymarket {
+            background-color: #152642 !important;
+            color: #93c5fd !important;
+            border: 1px solid #1e3963 !important;
+        }
+        .prob-high { color: #34d399 !important; font-weight: 700; }
+        .prob-mid { color: #fbbf24 !important; font-weight: 700; }
+        .prob-low { color: #f87171 !important; font-weight: 700; }
+
+        /* Form Inputs & Controls */
+        input, [data-testid="stTextInput"] input {
+            background-color: #1b202c !important;
+            color: #f1f5f9 !important;
+            border: 1px solid #2d3548 !important;
+            border-radius: 6px !important;
+        }
+        [data-baseweb="select"], 
+        [data-baseweb="select"] > div,
+        [data-testid="stMultiSelect"] > div,
+        [data-testid="stMultiSelect"] div[role="combobox"] {
+            background-color: #1b202c !important;
+            border-color: #2d3548 !important;
+            color: #f1f5f9 !important;
+        }
+        [data-baseweb="popover"], [data-baseweb="menu"], ul[data-baseweb="menu"] {
+            background-color: #1b202c !important;
+            border: 1px solid #2d3548 !important;
+            border-radius: 6px !important;
+        }
+        li[data-baseweb="menu-item"] {
+            background-color: #1b202c !important;
+            color: #e2e8f0 !important;
+        }
+        li[data-baseweb="menu-item"]:hover {
+            background-color: #272f42 !important;
+        }
+        [data-baseweb="tag"] {
+            background-color: #272f42 !important;
+            border: 1px solid #3b4661 !important;
+        }
+        [data-baseweb="tag"] span, [data-baseweb="tag"] div {
+            color: #cbd5e1 !important;
+            background-color: transparent !important;
+        }
+        [data-baseweb="select"] svg {
+            fill: #8b97ab !important;
+            color: #8b97ab !important;
+        }
+
+        /* Buttons & Link Buttons in Night Mode */
+        button, 
+        [data-testid="baseButton-secondary"], 
+        [data-testid="baseButton-primary"],
+        div[data-testid="stLinkButton"] a,
+        div[data-testid="stLinkButton"] > a {
+            background-color: #242b3b !important;
+            color: #e2e8f0 !important;
+            border: 1px solid #364057 !important;
+            border-radius: 6px !important;
+        }
+        div[data-testid="stLinkButton"] a * {
+            color: #e2e8f0 !important;
+        }
+        button:hover, 
+        [data-testid="baseButton-secondary"]:hover,
+        div[data-testid="stLinkButton"] a:hover {
+            background-color: #2e374c !important;
+            border-color: #485675 !important;
+            color: #ffffff !important;
+        }
+
+        /* Expander */
+        [data-testid="stExpander"] {
+            background-color: #161922 !important;
+            border: 1px solid #242a38 !important;
+            border-radius: 6px !important;
+        }
+        [data-testid="stExpander"] summary {
+            color: #cbd5e1 !important;
+        }
+        [data-testid="stExpander"] p {
+            color: #8b97ab !important;
+        }
+
+        /* Category Filter Pills in Night Mode */
+        button[data-testid="stBaseButton-pills"],
+        button[kind="pills"] {
+            background-color: #1b202c !important;
+            border: 1px solid #2e374c !important;
+            color: #94a3b8 !important;
+            border-radius: 9999px !important;
+            font-size: 0.8rem !important;
+            padding: 0.35rem 0.75rem !important;
+            margin-bottom: 0.35rem !important;
+            transition: all 0.15s ease !important;
+        }
+        button[data-testid="stBaseButton-pills"]:hover,
+        button[kind="pills"]:hover {
+            background-color: #272f42 !important;
+            border-color: #3b82f6 !important;
+            color: #f1f5f9 !important;
+        }
+        button[data-testid="stBaseButton-pillsActive"],
+        button[kind="pillsActive"] {
+            background-color: #2563eb !important;
+            border-color: #60a5fa !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+            border-radius: 9999px !important;
+            font-size: 0.8rem !important;
+            padding: 0.35rem 0.75rem !important;
+            margin-bottom: 0.35rem !important;
+        }
+        /* Toggle Switch in Night Mode */
+        [data-testid="stToggle"] label, [data-testid="stToggle"] span {
+            color: #e2e8f0 !important;
+        }
+        [data-testid="stToggle"] div[role="switch"] {
+            background-color: #242c3d !important;
+            border: 1.5px solid #475569 !important;
+        }
+        [data-testid="stToggle"] div[role="switch"][aria-checked="true"] {
+            background-color: #2563eb !important;
+            border-color: #60a5fa !important;
+        }
+        """
+    else:
+        theme_css = """
+        /* Day Mode Styling */
+        header[data-testid="stHeader"] {
+            background-color: transparent !important;
+        }
+        .stApp {
+            background-color: #f8fafc !important;
+            color: #0f172a !important;
+        }
+        [data-testid="stSidebar"] {
+            background-color: #ffffff !important;
+            border-right: 1px solid #e2e8f0 !important;
+        }
+        [data-testid="stSidebar"] * {
+            color: #0f172a !important;
+        }
+        [data-testid="stSidebar"] p,
+        [data-testid="stSidebar"] span,
+        [data-testid="stSidebar"] label {
+            color: #334155 !important;
+        }
+        [data-testid="stSidebar"] h1,
+        [data-testid="stSidebar"] h2,
+        [data-testid="stSidebar"] h3 {
+            color: #0f172a !important;
+        }
+        .status-pill {
+            background-color: #f1f5f9 !important;
+            color: #334155 !important;
+            border: 1px solid #cbd5e1 !important;
+        }
+        .forecast-card {
+            background: #ffffff !important;
+            border: 1px solid #e2e8f0 !important;
+            box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05) !important;
+        }
+        .forecast-card:hover {
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.08) !important;
+            border-color: #cbd5e1 !important;
+        }
+        .topic-header {
+            background-color: #f8fafc !important;
+            border-left: 4px solid #3b82f6 !important;
+        }
+        .topic-title {
+            color: #0f172a !important;
+        }
+        .topic-subtitle {
+            color: #475569 !important;
+        }
+        .card-question {
+            color: #1e293b !important;
+        }
+        .card-meta {
+            color: #64748b !important;
+        }
+        .metric-box {
+            background-color: #f8fafc !important;
+            border: 1px solid #e2e8f0 !important;
+        }
+        .metric-box-title {
+            color: #64748b !important;
+        }
+        .metric-box-val {
+            color: #0f172a !important;
+        }
+        .comparison-container {
+            background: #ffffff !important;
+            border: 1px solid #e2e8f0 !important;
+        }
+        .comparison-title {
+            color: #0f172a !important;
+        }
+        .badge-kalshi {
+            background-color: #ecfdf5 !important;
+            color: #065f46 !important;
+            border: 1px solid #a7f3d0 !important;
+        }
+        .badge-polymarket {
+            background-color: #eff6ff !important;
+            color: #1e40af !important;
+            border: 1px solid #bfdbfe !important;
+        }
+        .prob-high { color: #166534 !important; font-weight: 700; }
+        .prob-mid { color: #854d0e !important; font-weight: 700; }
+        .prob-low { color: #991b1b !important; font-weight: 700; }
+
+        /* High-Contrast Toggle Switch in Day Mode */
+        [data-testid="stToggle"] label, [data-testid="stToggle"] span {
+            color: #0f172a !important;
+            font-weight: 500 !important;
+        }
+        [data-testid="stToggle"] div[role="switch"] {
+            background-color: #cbd5e1 !important;
+            border: 2px solid #64748b !important;
+        }
+        [data-testid="stToggle"] div[role="switch"][aria-checked="true"] {
+            background-color: #2563eb !important;
+            border-color: #1d4ed8 !important;
+        }
+        [data-testid="stToggle"] div[role="switch"] > div {
+            background-color: #ffffff !important;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3) !important;
+        }
+
+        /* Form Inputs in Day Mode */
+        input, [data-testid="stTextInput"] input {
+            background-color: #ffffff !important;
+            color: #0f172a !important;
+            border: 1.5px solid #cbd5e1 !important;
+            border-radius: 6px !important;
+        }
+        input:focus, [data-testid="stTextInput"] input:focus {
+            border-color: #2563eb !important;
+            box-shadow: 0 0 0 1px #2563eb !important;
+        }
+
+        /* Radio & Slider in Day Mode */
+        [data-testid="stRadio"] label, [data-testid="stRadio"] p {
+            color: #0f172a !important;
+        }
+        [data-testid="stSlider"] label, [data-testid="stSlider"] p, [data-testid="stSlider"] div {
+            color: #0f172a !important;
+        }
+
+        /* Buttons & Link Buttons in Day Mode */
+        button, 
+        [data-testid="baseButton-secondary"], 
+        [data-testid="baseButton-primary"],
+        div[data-testid="stLinkButton"] a,
+        div[data-testid="stLinkButton"] > a {
+            background-color: #f1f5f9 !important;
+            color: #0f172a !important;
+            border: 1.5px solid #cbd5e1 !important;
+            border-radius: 6px !important;
+            font-weight: 500 !important;
+        }
+        div[data-testid="stLinkButton"] a * {
+            color: #0f172a !important;
+        }
+        button:hover, 
+        [data-testid="baseButton-secondary"]:hover,
+        div[data-testid="stLinkButton"] a:hover {
+            background-color: #e2e8f0 !important;
+            border-color: #94a3b8 !important;
+            color: #000000 !important;
+        }
+
+        /* Expander in Day Mode */
+        [data-testid="stExpander"] {
+            background-color: #ffffff !important;
+            border: 1px solid #e2e8f0 !important;
+            border-radius: 6px !important;
+        }
+        [data-testid="stExpander"] summary {
+            color: #1e293b !important;
+        }
+        [data-testid="stExpander"] p {
+            color: #475569 !important;
+        }
+
+        /* Category Filter Pills in Day Mode */
+        button[data-testid="stBaseButton-pills"],
+        button[kind="pills"] {
+            background-color: #f8fafc !important;
+            border: 1.5px solid #cbd5e1 !important;
+            color: #475569 !important;
+            border-radius: 9999px !important;
+            font-size: 0.8rem !important;
+            padding: 0.35rem 0.75rem !important;
+            margin-bottom: 0.35rem !important;
+            transition: all 0.15s ease !important;
+        }
+        button[data-testid="stBaseButton-pills"]:hover,
+        button[kind="pills"]:hover {
+            background-color: #f1f5f9 !important;
+            border-color: #2563eb !important;
+            color: #0f172a !important;
+        }
+        button[data-testid="stBaseButton-pillsActive"],
+        button[kind="pillsActive"] {
+            background-color: #1d4ed8 !important;
+            border-color: #1e40af !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+            border-radius: 9999px !important;
+            font-size: 0.8rem !important;
+            padding: 0.35rem 0.75rem !important;
+            margin-bottom: 0.35rem !important;
+            box-shadow: 0 0 8px rgba(29, 78, 216, 0.35) !important;
+        }
+        """
+
+    st.markdown(f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    html, body, [class*="css"] {{ font-family: 'Inter', -apple-system, sans-serif; }}
+    .block-container {{ padding-top: 1.5rem !important; padding-bottom: 2rem !important; max-width: 1350px !important; }}
+    h1 {{ font-size: 1.85rem !important; font-weight: 700 !important; margin-bottom: 0.2rem !important; }}
+    h2 {{ font-size: 1.35rem !important; font-weight: 600 !important; margin-top: 1rem !important; }}
+    h3 {{ font-size: 1.1rem !important; font-weight: 600 !important; }}
+    .status-pill {{ display: inline-block; padding: 0.25rem 0.65rem; font-size: 0.8rem; font-weight: 500; border-radius: 9999px; margin-right: 0.5rem; }}
+    .forecast-card {{ border-radius: 8px; padding: 1.1rem; margin-bottom: 0.85rem; transition: box-shadow 0.2s ease, border-color 0.2s ease; }}
+    .badge-kalshi, .badge-polymarket {{ font-size: 0.75rem; font-weight: 600; padding: 0.2rem 0.55rem; border-radius: 4px; text-transform: uppercase; }}
+    .metric-box {{ text-align: center; padding: 0.5rem; border-radius: 6px; }}
+    .metric-box-title {{ font-size: 0.75rem; font-weight: 500; margin-bottom: 0.2rem; text-transform: uppercase; letter-spacing: 0.025em; }}
+    .metric-box-val {{ font-size: 1.15rem; font-weight: 700; }}
+    .topic-header {{ padding: 0.65rem 1rem; border-radius: 0 6px 6px 0; margin: 1.25rem 0 0.75rem 0; }}
+    .topic-title {{ font-size: 1.15rem; font-weight: 600; margin: 0; }}
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {{ gap: 0.5rem !important; }}
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] > div {{ margin-bottom: 0 !important; }}
+    [data-testid="stSidebar"] .block-container {{ padding-top: 1rem !important; padding-bottom: 1.5rem !important; }}
+
+    /* Prevent screen dimming and opacity fading during execution or refresh */
+    [data-testid="stAppViewContainer"],
+    [data-testid="stAppViewBlockContainer"],
+    section.main,
+    .block-container,
+    div[data-testid="stVerticalBlock"],
+    div[data-testid="stElementContainer"] {{
+        opacity: 1 !important;
+        transition: none !important;
+        filter: none !important;
+    }}
+    [data-test-script-state="running"] {{
+        opacity: 1 !important;
+    }}
+    div[data-testid="stStatusWidget"] {{
+        visibility: hidden !important;
+    }}
+    {theme_css}
+    </style>
+    """, unsafe_allow_html=True)
+
+inject_theme_css(st.session_state.dark_mode)
+
+
+def format_money(val: float | None) -> str:
+    """Format dollar amounts into readable plain English."""
+    if not val or val <= 0:
         return "$0"
-    return f"${oi/1_000_000:.1f}M" if oi >= 1_000_000 else f"${oi/1_000:.0f}K"
+    if val >= 1_000_000_000:
+        return f"${val / 1_000_000_000:.2f}B"
+    if val >= 1_000_000:
+        return f"${val / 1_000_000:.1f}M"
+    if val >= 1_000:
+        return f"${val / 1_000:.0f}K"
+    return f"${val:.0f}"
 
 
-def display_metric(label: str, value: str, color: str = None) -> None:
-    """Display metric with consistent styling (label + value)."""
-    if color is None:
-        color = COLORS["metric_value"]
-    st.markdown(
-        f"<div style='margin: 3px 0;'>"
-        f"<span style='font-weight: 500; font-size: 12px; color: {COLORS['metric_label']};'>{label}:</span> "
-        f"<span style='color: {color}; font-weight: 600; font-size: 13px;'>{value}</span>"
-        f"</div>",
-        unsafe_allow_html=True
-    )
+def format_date(date_str: str | None) -> str:
+    """Format ISO date string to plain English date."""
+    if not date_str:
+        return "Not specified"
+    try:
+        clean_str = date_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean_str)
+        return dt.strftime("%b %d, %Y")
+    except Exception:
+        return str(date_str)[:10]
 
 
-@retry_on_db_lock(max_retries=3, initial_delay=0.1)
-def get_db():
-    """Get database connection."""
+def format_relative_refresh(date_str: str | None) -> str:
+    """Format ISO timestamp to relative and absolute freshness (e.g. '5m ago (14:32 UTC)')."""
+    if not date_str:
+        return "Not available"
+    try:
+        clean_str = date_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        diff_sec = max(0, int((now - dt).total_seconds()))
+
+        utc_time = dt.strftime("%H:%M UTC")
+        if diff_sec < 60:
+            return f"Just now ({utc_time})"
+        elif diff_sec < 3600:
+            return f"{diff_sec // 60}m ago ({utc_time})"
+        elif diff_sec < 86400:
+            return f"{diff_sec // 3600}h ago ({utc_time})"
+        else:
+            return dt.strftime("%b %d, %H:%M UTC")
+    except Exception:
+        return "Recent"
+
+
+def is_data_stale(date_str: str | None, max_age_hours: float = 6.0) -> bool:
+    """Return True if data timestamp is missing or older than max_age_hours."""
+    if not date_str:
+        return True
+    try:
+        clean_str = date_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        diff_sec = max(0, int((now - dt).total_seconds()))
+        return diff_sec >= max_age_hours * 3600
+    except Exception:
+        return True
+
+
+def get_db_connection():
+    """Create a SQLite database connection with row factory."""
     conn = sqlite3.connect(DATABASE_PATH, timeout=10.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-@retry_on_db_lock(max_retries=3, initial_delay=0.1)
-def load_markets():
-    """Load markets from database including source, duplicate_group_id, and liquidity.
-    Returns DataFrame with all market fields; source='polymarket'|'kalshi' identifies platform.
-    duplicate_group_id links markets that appear on both platforms (based on 85% question similarity).
-    liquidity represents market depth/trading capacity from fetchers."""
-    conn = get_db()
+@st.cache_data(ttl=60)
+def load_all_markets() -> pd.DataFrame:
+    """Load all current active markets from SQLite (cached with 60s TTL)."""
+    conn = get_db_connection()
     try:
         query = """
-        SELECT id, question, volume, volume_24h, open_interest, probability, category, source, duplicate_group_id, liquidity
-        FROM markets
-        ORDER BY open_interest DESC
+            SELECT id, source, topic_title, question, liquidity, volume, volume_24h,
+                   open_interest, probability, category, end_date, rules, url, duplicate_group_id
+            FROM markets
+            ORDER BY open_interest DESC
         """
         df = pd.read_sql_query(query, conn)
         return df
-    except sqlite3.Error as e:
+    except Exception as e:
         logger.error(f"Failed to load markets: {e}")
-        st.error(f"Database error: {e}")
         return pd.DataFrame()
     finally:
         conn.close()
 
 
-@retry_on_db_lock(max_retries=3, initial_delay=0.1)
-def get_last_refresh_time():
-    """Get last refresh timestamp."""
-    conn = get_db()
+def get_metadata(key: str) -> str | None:
+    """Retrieve metadata key from SQLite."""
+    conn = get_db_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM metadata WHERE key = ? ORDER BY updated_at DESC LIMIT 1", ("last_refresh",))
-        result = cursor.fetchone()
-        return result[0] if result else None
-    except sqlite3.Error:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM metadata WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception:
         return None
     finally:
         conn.close()
 
 
-@retry_on_db_lock(max_retries=3, initial_delay=0.1)
-def load_watchlist():
-    """Load user's watchlist. Cached in session to avoid repeated DB calls."""
-    # Check session cache
-    if st.session_state.watchlist_cache is not None:
-        return st.session_state.watchlist_cache
-    
-    conn = get_db()
+def load_watchlist_ids() -> set:
+    """Load IDs of watchlisted markets."""
+    conn = get_db_connection()
     try:
-        query = "SELECT m.id FROM markets m INNER JOIN watchlist w ON m.id = w.market_id"
-        df = pd.read_sql_query(query, conn)
-        result = set(df['id'].tolist()) if len(df) > 0 else set()
-        st.session_state.watchlist_cache = result
-        return result
-    except sqlite3.Error:
-        st.session_state.watchlist_cache = set()
+        cur = conn.cursor()
+        cur.execute("SELECT market_id FROM watchlist")
+        return {row[0] for row in cur.fetchall()}
+    except Exception:
         return set()
     finally:
         conn.close()
 
 
-@retry_on_db_lock(max_retries=3, initial_delay=0.1)
-def add_to_watchlist(market_id: str):
-    """Add to watchlist and update session state."""
-    conn = get_db()
+def toggle_watchlist(market_id: str, is_in_watchlist: bool):
+    """Add or remove market from watchlist."""
+    conn = get_db_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO watchlist (market_id) VALUES (?)", (market_id,))
-        conn.commit()
-        st.session_state.watchlist_cache = None  # Clear cache
-        # Update session to track this item was added
-        if 'watchlist_updates' not in st.session_state:
-            st.session_state.watchlist_updates = {}
-        st.session_state.watchlist_updates[market_id] = True
-        return True
-    except sqlite3.Error:
-        return False
-    finally:
-        conn.close()
-
-
-@retry_on_db_lock(max_retries=3, initial_delay=0.1)
-def remove_from_watchlist(market_id: str):
-    """Remove from watchlist and update session state."""
-    conn = get_db()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM watchlist WHERE market_id = ?", (market_id,))
-        conn.commit()
-        st.session_state.watchlist_cache = None  # Clear cache
-        # Update session to track this item was removed
-        if 'watchlist_updates' not in st.session_state:
-            st.session_state.watchlist_updates = {}
-        st.session_state.watchlist_updates[market_id] = False
-        return True
-    except sqlite3.Error:
-        return False
-    finally:
-        conn.close()
-
-
-def get_refresh_status():
-    """Get human-readable refresh status."""
-    last_refresh = get_last_refresh_time()
-    if not last_refresh:
-        return "Never refreshed", "red"
-    
-    try:
-        last_dt = pd.to_datetime(last_refresh, utc=True).to_pydatetime()
-        delta = now_utc() - last_dt
-        minutes_ago = int(delta.total_seconds() / 60)
-        
-        if minutes_ago < 1:
-            return "Just updated", "green"
-        elif minutes_ago < 60:
-            return f"Updated {minutes_ago}m ago", "green"
+        cur = conn.cursor()
+        if is_in_watchlist:
+            cur.execute("DELETE FROM watchlist WHERE market_id = ?", (market_id,))
         else:
-            hours_ago = minutes_ago // 60
-            return f"Updated {hours_ago}h ago", "orange" if hours_ago < 7 else "red"
+            cur.execute("INSERT OR IGNORE INTO watchlist (market_id) VALUES (?)", (market_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@st.cache_resource
+def ensure_db_initialized() -> bool:
+    """Initialize database schema once per process."""
+    db = DatabaseManager(DATABASE_PATH)
+    db.connect()
+    db.init_schema()
+    db.close()
+    return True
+
+
+ensure_db_initialized()
+
+
+def get_market_count() -> int:
+    """Quick market count check."""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM markets")
+        row = cur.fetchone()
+        return row[0] if row else 0
     except Exception:
-        return "Unknown", "gray"
+        return 0
+    finally:
+        conn.close()
 
 
 # ============================================================================
-# MAIN DASHBOARD
+# INITIALIZATION & COLD-START LOADING UX
 # ============================================================================
 
-# Load data
-df = load_markets()
+market_count = get_market_count()
 
-if len(df) == 0:
-    st.warning("⚠️ No data available. Run: `python main.py`")
-    st.stop()
 
-# Normalize categories
-df['category'] = df['category'].str.lower().replace(
-    {'science': 'Science and Tech', 'science and technology': 'Science and Tech', 'tech': 'Science and Tech'},
-    regex=False
-)
-
-# Sidebar filters
-with st.sidebar:
-    st.markdown("<h3 style='margin: 0; padding: 0; font-size: 0.9rem;'>🎚️ Filters</h3>", unsafe_allow_html=True)
-    st.divider()
-    
-    # Market source filter
-    source_option = st.radio("Market Source", ["Both", "Polymarket", "Kalshi"], index=0, horizontal=True)
-    
-    # Categories (collapsed by default)
-    available_categories = sorted(df['category'].unique().tolist()) if 'category' in df.columns else []
-    selected_categories = []
-    with st.expander("📁 Categories", expanded=False):
-        for cat in available_categories:
-            if st.checkbox(cat, value=False, key=f"cat_{cat}"):
-                selected_categories.append(cat)
-    st.divider()
-    
-    # Watchlist
-    show_favorites_only = st.checkbox("Show Favorites Only", value=False)
-    
-    # Overlapping markets (different terminology, same feature)
-    show_overlaps_only = st.checkbox("Show Overlapping Markets Only (appear on both platforms)", value=False)
-    st.divider()
-    
-    # OI threshold
-    max_oi = int(df['open_interest'].max()) if len(df) > 0 else 1_000_000_000
-    min_open_interest = st.slider("Minimum OI ($)", 50_000, max_oi, 50_000, format="$%d")
-    
-    # Probability range
-    prob_min, prob_max = st.slider("Probability Range (%)", 0, 100, (0, 100))
-    st.divider()
-    
-    # Quick Reference
-    with st.expander("📖 Quick Reference", expanded=False):
-        st.markdown("**Platform Badges:**")
-        st.markdown(f"<span style='background-color: {COLORS['polymarket']}; color: white; padding: 3px 6px; border-radius: 2px; font-size: 0.85rem;'>Polymarket</span> | <span style='background-color: {COLORS['kalshi']}; color: white; padding: 3px 6px; border-radius: 2px; font-size: 0.85rem;'>Kalshi</span>", unsafe_allow_html=True)
-        st.markdown("**Probability Colors:** Red (unlikely) → Green (likely)")
-        st.markdown("**Metrics:**")
-        st.markdown("- **OI:** Open Interest (market depth)")
-        st.markdown("- **Volume:** Total/24h trading activity")
-        st.markdown("- **Liquidity:** Market maker depth")
-        st.markdown("**Icons:**")
-        st.markdown("- **❤️ / 🤍:** Add/remove from favorites")
-        st.markdown("- **🔗 Overlap:** View matching market on other platform")
-
-# Apply filters
-df_filtered = df[
-    (df['open_interest'] >= min_open_interest) &
-    (df['probability'] >= prob_min) &
-    (df['probability'] <= prob_max)
-].copy()
-
-if selected_categories:
-    df_filtered = df_filtered[df_filtered['category'].isin(selected_categories)]
-
-# Apply source filter
-if source_option == "Polymarket":
-    df_filtered = df_filtered[df_filtered['source'] == 'polymarket']
-elif source_option == "Kalshi":
-    df_filtered = df_filtered[df_filtered['source'] == 'kalshi']
-
-# Watchlist filter
-if show_favorites_only:
-    user_watchlist = load_watchlist()
-    df_filtered = df_filtered[df_filtered['id'].isin(user_watchlist)]
-
-# Overlaps filter
-if show_overlaps_only:
-    df_filtered = df_filtered[df_filtered['duplicate_group_id'].notna()]
-
-# Main content
-st.title("Market Consensus Intelligence")
-st.markdown("**Harness collective Human intelligence to inform strategic business decisions**")
-
-col_refresh, col_status = st.columns([2, 3])
-with col_refresh:
-    if st.button("Refresh Data", use_container_width=True):
-        import asyncio
-        from pipeline import find_duplicate_groups
-        from fetchers.polymarket_api import fetch_all_markets as fetch_polymarket
-        from fetchers.kalshi_api import fetch_all_markets as fetch_kalshi
+# If cold start (no data exists), display loading screen and fetch immediately
+if market_count == 0:
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("""
+        <div style='text-align: center; padding: 2.5rem; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);'>
+            <h2 style='margin-bottom: 0.5rem;'>Initializing Forecast Hub</h2>
+            <p style='color: #64748b; font-size: 0.95rem; margin-bottom: 1.5rem;'>
+                Connecting to Polymarket and Kalshi APIs to ingest verified prediction markets and establish cross-platform consensus...
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
         
-        with st.spinner("Fetching data..."):
+        with st.spinner("Fetching active forecast markets over HTTP/2..."):
             try:
-                async def fetch_both():
-                    pm, k = await asyncio.gather(fetch_polymarket(), fetch_kalshi(), return_exceptions=True)
-                    pm = pm if not isinstance(pm, Exception) else []
-                    k = k if not isinstance(k, Exception) else []
-                    for m in pm:
-                        m['source'] = 'polymarket'
-                    for m in k:
-                        m['source'] = 'kalshi'
-                    return pm + k
-                
-                markets = asyncio.run(fetch_both())
-                if markets:
-                    db = DatabaseManager()
-                    db.connect()
-                    db.init_schema()
-                    dup_groups = find_duplicate_groups(markets)
-                    db.insert_markets(markets, dup_groups)
-                    db.close()
-                    st.success(f"✅ {len(markets)} markets updated")
+                exit_code = asyncio.run(run_pipeline())
+                if exit_code == 0:
+                    st.success("Ingestion complete. Loading dashboard...")
                     st.rerun()
                 else:
-                    st.error("No markets fetched")
+                    st.error("Failed to complete initial market fetch. Please check network connection.")
             except Exception as e:
-                st.error(f"Failed: {e}")
+                st.error(f"Startup error: {e}")
+        st.stop()
 
-with col_status:
-    refresh_status, _ = get_refresh_status()
-    st.markdown(f"**{refresh_status}**")
 
-st.divider()
+# ============================================================================
+# MAIN APPLICATION
+# ============================================================================
 
-# Metrics (filter-aware)
-col1, col2, col3 = st.columns(3)
-with col1:
-    high_consensus = ((df_filtered['probability'] > 70) | (df_filtered['probability'] < 30)).sum()
-    st.metric("High Conviction", high_consensus)
-with col2:
-    overlapping = df_filtered[df_filtered['duplicate_group_id'].notna()].shape[0]
-    st.metric("Overlapping Markets", overlapping)
-with col3:
-    st.metric("Total Markets", len(df_filtered))
+df = load_all_markets()
+last_refresh = get_metadata("last_refresh")
+watchlist_ids = load_watchlist_ids()
 
-st.divider()
+# Automatic background refresh if data already exists and is older than 6 hours
+if market_count > 0 and is_data_stale(last_refresh, max_age_hours=6.0):
+    if trigger_background_sync():
+        logger.info("Market data is older than 6 hours. Background sync triggered silently.")
 
-# Initialize search state
-if 'search_query' not in st.session_state:
-    st.session_state.search_query = ""
+# Top Header & Command Bar
+refresh_str = format_relative_refresh(last_refresh)
 
-# Search bar (compact) with clear and suggestions
-col_search, col_clear = st.columns([0.95, 0.05])
+top_hdr_col, top_actions_col = st.columns([3, 1.4])
+with top_hdr_col:
+    title_color = "#f8fafc" if st.session_state.dark_mode else "#0f172a"
+    badge_bg = "#1e293b" if st.session_state.dark_mode else "#eff6ff"
+    badge_color = "#38bdf8" if st.session_state.dark_mode else "#1d4ed8"
+    badge_border = "#334155" if st.session_state.dark_mode else "#bfdbfe"
+    sub_color = "#94a3b8" if st.session_state.dark_mode else "#64748b"
 
-# Clear button first (before widget instantiation)
-with col_clear:
-    if st.button("✕", key="clear_search", help="Clear search"):
-        st.session_state.search_query = ""
+    st.markdown(f"""
+    <div style='display: flex; align-items: center; gap: 0.85rem; margin-top: -0.4rem;'>
+        <h1 style='color: {title_color}; margin: 0; font-size: 2.2rem; font-weight: 800; letter-spacing: -0.025em;'>Forecast Hub</h1>
+        <span style='font-size: 0.72rem; font-weight: 700; padding: 0.25rem 0.65rem; border-radius: 9999px; background: {badge_bg}; color: {badge_color}; border: 1px solid {badge_border}; letter-spacing: 0.05em; display: inline-flex; align-items: center;'>
+            <span style='width: 7px; height: 7px; border-radius: 50%; background: #22c55e; margin-right: 6px; box-shadow: 0 0 6px #22c55e;'></span>LIVE INTELLIGENCE
+        </span>
+    </div>
+    <p style='color: {sub_color}; font-size: 0.92rem; margin-top: 0.25rem; margin-bottom: 0.85rem;'>
+        Institutional prediction market consensus synthesized from Polymarket and Kalshi.
+    </p>
+    """, unsafe_allow_html=True)
 
-# Then render selectbox with callback
-with col_search:
-    suggestions = df_filtered['question'].unique().tolist() if len(df_filtered) > 0 else []
-    search_query = st.selectbox(
-        "Search markets",
-        options=[""] + suggestions,
-        index=0,
-        format_func=lambda x: x if x else "Search by question...",
-        key="search_query",
-        label_visibility="collapsed"
+with top_actions_col:
+    st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
+    act1, act2 = st.columns([1.4, 1])
+    with act1:
+        if st.button("↻ Refresh Data", key="top_refresh_btn", use_container_width=True):
+            st.cache_data.clear()
+            if trigger_background_sync():
+                st.toast("Syncing latest market consensus in background...", icon="↻")
+            else:
+                st.toast("Sync already running in background...", icon="⏳")
+    with act2:
+        mode_label = "🌙 Dark" if st.session_state.dark_mode else "☀️ Light"
+        mode_help = "Switch to Light Mode" if st.session_state.dark_mode else "Switch to Dark Mode"
+        if st.button(mode_label, key="theme_toggle_btn", help=mode_help, use_container_width=True):
+            st.session_state.dark_mode = not st.session_state.dark_mode
+            st.rerun()
+    time_color = "#64748b" if st.session_state.dark_mode else "#94a3b8"
+    sync_status = " <span style='color: #38bdf8;'>(Syncing...)</span>" if is_sync_running() else ""
+    st.markdown(f"<div style='text-align: right; font-size: 0.78rem; color: {time_color}; margin-top: -0.2rem;'>Updated: <b>{refresh_str}</b>{sync_status}</div>", unsafe_allow_html=True)
+
+# Status Bar
+total_volume = df['volume'].sum() if not df.empty else 0
+total_oi = df['open_interest'].sum() if not df.empty else 0
+unique_topics = df['topic_title'].nunique() if not df.empty else 0
+
+sync_pill = "<span class='status-pill' style='background-color: #0284c7 !important; color: #ffffff !important; font-weight: 600;'>↻ Syncing in background</span>" if is_sync_running() else ""
+
+st.markdown(f"""
+<div style='margin-bottom: 1.25rem;'>
+    <span class='status-pill'>Active Markets: <b>{len(df):,}</b></span>
+    <span class='status-pill'>Event Topics: <b>{unique_topics:,}</b></span>
+    <span class='status-pill'>Total Market Activity: <b>{format_money(total_oi)}</b></span>
+    <span class='status-pill'>Last Refreshed: <b>{refresh_str}</b></span>
+    {sync_pill}
+</div>
+""", unsafe_allow_html=True)
+
+# Prominent Search Bar
+search_query = st.text_input(
+    "Search",
+    placeholder="🔍 Search topics, questions, rules, or tickers (e.g. Fed rate cut, Nvidia, inflation, recession)...",
+    label_visibility="collapsed",
+    key="search_input"
+)
+
+
+# ============================================================================
+# SIDEBAR FILTERS (Compact & Zero-Scroll)
+# ============================================================================
+
+with st.sidebar:
+    st.markdown("### Decision Filters")
+
+    # Dynamic facet counts calculated from active baseline criteria
+    curr_min_prob = st.session_state.get("filter_min_prob", 0)
+    curr_min_oi = st.session_state.get("filter_min_oi", 10_000)
+    curr_platform = st.session_state.get("filter_platform", "Both Platforms")
+    curr_search = st.session_state.get("search_input", "")
+
+    facet_df = df.copy()
+    if curr_min_prob > 0:
+        facet_df = facet_df[facet_df['probability'].fillna(0) >= curr_min_prob]
+    if curr_min_oi > 0:
+        facet_df = facet_df[facet_df['open_interest'].fillna(0) >= curr_min_oi]
+    if curr_platform == "Polymarket Only":
+        facet_df = facet_df[facet_df['source'] == 'polymarket']
+    elif curr_platform == "Kalshi Only":
+        facet_df = facet_df[facet_df['source'] == 'kalshi']
+    if curr_search and curr_search.strip():
+        search_tokens = curr_search.strip().lower().split()
+        search_corpus = (
+            facet_df['question'].fillna('') + ' ' +
+            facet_df['topic_title'].fillna('') + ' ' +
+            facet_df['category'].fillna('') + ' ' +
+            facet_df['rules'].fillna('')
+        ).str.lower()
+        search_mask = pd.Series(True, index=facet_df.index)
+        for token in search_tokens:
+            search_mask &= search_corpus.str.contains(token, regex=False)
+        facet_df = facet_df[search_mask]
+
+    cat_counts = facet_df['category'].value_counts().to_dict() if not facet_df.empty else {}
+    all_categories = sorted([c for c in df['category'].dropna().unique() if c])
+
+    CAT_ICONS = {
+        "Economy & Macro": "📈",
+        "Finance & Markets": "💰",
+        "Politics & Governance": "🏛️",
+        "Companies & Business": "🏢",
+        "Technology & Science": "🔬",
+        "Global Affairs": "🌐"
+    }
+
+    st.markdown("<p style='font-size: 0.85rem; font-weight: 600; margin-bottom: 0.35rem; margin-top: 0.2rem;'>Categories</p>", unsafe_allow_html=True)
+    selected_pills = st.pills(
+        "Categories",
+        options=all_categories,
+        selection_mode="multi",
+        label_visibility="collapsed",
+        format_func=lambda cat: f"{CAT_ICONS.get(cat, '📁')} {cat} ({cat_counts.get(cat, 0):,})",
+        key="filter_categories",
+        help="Click to isolate specific sectors. All active when none selected."
     )
 
-# Sorting and pagination controls
-col_metric, col_direction = st.columns([2, 1])
-with col_metric:
-    sort_metric = st.selectbox("Sort By", ["Open Interest", "24h Volume", "Total Volume", "Liquidity", "Probability"], index=0)
-with col_direction:
-    sort_direction = st.radio("Direction", ["High → Low", "Low → High"], index=0, horizontal=True)
+    selected_categories = selected_pills if selected_pills else all_categories
 
-# Map sort metric to column
-sort_map = {
-    "Open Interest": "open_interest",
-    "24h Volume": "volume_24h",
-    "Total Volume": "volume",
-    "Liquidity": "liquidity",
-    "Probability": "probability",
-}
+    # Minimum likelihood
+    min_prob = st.slider("Minimum Likelihood", min_value=0, max_value=100, value=0, format="%d%%", key="filter_min_prob")
 
-sort_column = sort_map[sort_metric]
-sort_ascending = (sort_direction == "Low → High")
+    # Minimum capital active
+    min_oi = st.slider(
+        "Minimum Money Placed",
+        min_value=0,
+        max_value=1_000_000,
+        value=10_000,
+        step=10_000,
+        format="$%d",
+        key="filter_min_oi",
+        help="Filter for contracts with verifiable capital commitment"
+    )
 
-# Apply search filter if query exists
-if search_query.strip():
-    df_filtered = df_filtered[df_filtered['question'].str.contains(search_query, case=False, na=False)]
+    platform_filter = st.radio(
+        "Platforms",
+        options=["Both Platforms", "Polymarket Only", "Kalshi Only"],
+        index=0,
+        key="filter_platform"
+    )
 
-# Pagination
-if 'markets_per_page' not in st.session_state:
-    st.session_state.markets_per_page = 20
-if 'current_page' not in st.session_state:
-    st.session_state.current_page = 1
+    st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+    if st.button("↺ Reset Filters", key="reset_filters_btn", help="Reset all filters to defaults", use_container_width=True):
+        for k in ["filter_categories", "filter_min_prob", "filter_min_oi", "filter_platform", "search_input"]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
 
-st.divider()
 
-# Market list
-df_filtered_sorted = df_filtered.sort_values(sort_column, ascending=sort_ascending).reset_index(drop=True)
-total_markets = len(df_filtered_sorted)
 
-# Load watchlist once for all cards
-user_watchlist = load_watchlist()
 
-# Check if showing overlaps only
-showing_overlaps_only = (show_overlaps_only or st.session_state.show_overlaps_view) and len(df_filtered_sorted) > 0
+# Apply filters
+filtered_df = df.copy()
 
-if showing_overlaps_only:
-    # Show back button if navigated from a market card
-    if st.session_state.show_overlaps_view:
-        if st.button("← Back to Markets"):
-            st.session_state.show_overlaps_view = False
-            st.session_state.navigate_to_group = None
+# Filter by selected categories (deselecting all correctly filters to empty)
+filtered_df = filtered_df[filtered_df['category'].isin(selected_categories)]
+
+
+if min_prob > 0:
+    filtered_df = filtered_df[filtered_df['probability'].fillna(0) >= min_prob]
+
+if min_oi > 0:
+    filtered_df = filtered_df[filtered_df['open_interest'].fillna(0) >= min_oi]
+
+if platform_filter == "Polymarket Only":
+    filtered_df = filtered_df[filtered_df['source'] == 'polymarket']
+elif platform_filter == "Kalshi Only":
+    filtered_df = filtered_df[filtered_df['source'] == 'kalshi']
+
+# Tokenized multi-term search across questions, topics, categories, and settlement rules
+if search_query and search_query.strip():
+    tokens = search_query.strip().lower().split()
+    search_corpus = (
+        filtered_df['question'].fillna('') + ' ' +
+        filtered_df['topic_title'].fillna('') + ' ' +
+        filtered_df['category'].fillna('') + ' ' +
+        filtered_df['rules'].fillna('')
+    ).str.lower()
+    
+    match_mask = pd.Series(True, index=filtered_df.index)
+    for token in tokens:
+        match_mask &= search_corpus.str.contains(token, regex=False)
+    filtered_df = filtered_df[match_mask]
+
+
+
+# ============================================================================
+# MAIN TABS (Two-Tier View, Cross-Platform Comparison, Watchlist)
+# ============================================================================
+
+tab_topics, tab_comparison, tab_watchlist = st.tabs([
+    "Forecasts by Event Topic",
+    "Cross-Platform Consensus",
+    "Watchlist"
+])
+
+
+def render_market_item(row, prefix: str = "", show_toggle: bool = True):
+    """Render a single market prediction cleanly with plain English terms."""
+    m_id = row['id']
+    source = row.get('source', 'polymarket').lower()
+    prob = row.get('probability')
+    vol = row.get('volume', 0)
+    oi = row.get('open_interest', 0)
+    question = row.get('question') or "Untitled Market"
+    target_date = format_date(row.get('end_date'))
+    rules = row.get('rules') or ""
+    url = row.get('url') or ""
+    is_saved = m_id in watchlist_ids
+
+    badge_html = f"<span class='badge-{source}'>{source}</span>"
+    
+    # Likelihood color class
+    prob_display = f"{prob:.1f}%" if prob is not None else "Pending"
+    prob_class = "prob-high" if prob and prob >= 60 else ("prob-mid" if prob and prob >= 30 else "prob-low")
+
+    st.markdown(f"""
+    <div class='forecast-card'>
+        <div style='display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.6rem;'>
+            <div style='flex: 1;'>
+                {badge_html}
+                <span class='card-meta' style='font-size: 0.8rem; margin-left: 0.5rem;'>Target Date: <b>{target_date}</b></span>
+                <div class='card-question' style='font-size: 1rem; font-weight: 600; margin-top: 0.4rem;'>{question}</div>
+            </div>
+            <div style='text-align: right; min-width: 110px;'>
+                <div class='card-meta' style='font-size: 0.75rem; font-weight: 500; text-transform: uppercase;'>Likelihood</div>
+                <div class='{prob_class}' style='font-size: 1.45rem;'>{prob_display}</div>
+            </div>
+        </div>
+        <div style='display: flex; gap: 1rem; margin-top: 0.5rem;'>
+            <div class='metric-box' style='flex: 1;'>
+                <div class='metric-box-title'>Total Money Placed</div>
+                <div class='metric-box-val'>{format_money(oi)}</div>
+            </div>
+            <div class='metric-box' style='flex: 1;'>
+                <div class='metric-box-title'>Trading Volume</div>
+                <div class='metric-box-val'>{format_money(vol)}</div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Action bar below card (Direct URL link, watchlist toggle, rules)
+    act_col1, act_col2 = st.columns([1, 1])
+    with act_col1:
+        if url:
+            st.link_button("↗ View Contract", url, use_container_width=True)
+    with act_col2:
+        btn_label = "★ In Watchlist" if is_saved else "☆ Add to Watchlist"
+        if st.button(btn_label, key=f"{prefix}_wl_{m_id}", use_container_width=True):
+            toggle_watchlist(m_id, is_saved)
             st.rerun()
-        st.divider()
-    
-    # Filter to ONLY groups with markets from BOTH platforms (true overlaps)
-    # First, exclude markets with no overlap group ID
-    df_with_overlaps = df_filtered_sorted[pd.notna(df_filtered_sorted['duplicate_group_id'])]
-    
-    if len(df_with_overlaps) == 0:
-        st.info("📭 No overlapping markets found.")
+
+    if rules:
+        with st.expander("Decision & Settlement Rules"):
+            st.markdown(f"<p style='font-size: 0.82rem; line-height: 1.4; opacity: 0.85;'>{rules}</p>", unsafe_allow_html=True)
+
+
+# ----------------------------------------------------------------------------
+# TAB 1: Forecasts by Event Topic (Two-Tier Parent/Child)
+# ----------------------------------------------------------------------------
+
+with tab_topics:
+    if filtered_df.empty:
+        st.info("No forecasts match your selected filters. Adjust your criteria in the sidebar.")
     else:
-        grouped = df_with_overlaps.groupby('duplicate_group_id')
-        true_overlaps = []
-        for group_id, group_markets in grouped:
-            sources = group_markets['source'].unique()
-            # Only include groups with markets from BOTH Polymarket AND Kalshi
-            if len(sources) >= 2 and 'polymarket' in [s.lower() for s in sources] and 'kalshi' in [s.lower() for s in sources]:
-                true_overlaps.append(group_id)
+        # Group by topic title
+        grouped = filtered_df.groupby('topic_title')
         
-        if len(true_overlaps) == 0:
-            st.info("📭 No overlapping markets found between platforms.")
+        # Sort topics by total money placed
+        topic_order = filtered_df.groupby('topic_title')['open_interest'].sum().sort_values(ascending=False).index
+
+        for topic in topic_order:
+            topic_markets = grouped.get_group(topic)
+            topic_oi = topic_markets['open_interest'].sum()
+            topic_count = len(topic_markets)
+            
+            st.markdown(f"""
+            <div class='topic-header'>
+                <div style='display: flex; justify-content: space-between; align-items: center;'>
+                    <div class='topic-title'>{topic}</div>
+                    <div style='font-size: 0.82rem; color: #475569;'>
+                        <b>{topic_count}</b> related contract{'s' if topic_count > 1 else ''} | Total Size: <b>{format_money(topic_oi)}</b>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            for _, row in topic_markets.iterrows():
+                render_market_item(row, prefix="topic")
+
+
+# ----------------------------------------------------------------------------
+# TAB 2: Cross-Platform Consensus (Side-by-side comparison)
+# ----------------------------------------------------------------------------
+
+with tab_comparison:
+    st.markdown("### Cross-Platform Consensus")
+    st.markdown("<p style='color: #64748b; font-size: 0.9rem;'>Direct side-by-side comparison where both Polymarket and Kalshi track the exact same target event.</p>", unsafe_allow_html=True)
+
+    matched_groups = filtered_df[filtered_df['duplicate_group_id'].notna()]['duplicate_group_id'].unique()
+
+    if len(matched_groups) == 0:
+        st.info("No matching cross-platform contracts currently meet your active filter criteria.")
+    else:
+        for gid in matched_groups:
+            pair = filtered_df[filtered_df['duplicate_group_id'] == gid]
+            if len(pair) < 2:
+                continue
+
+            pm_row = pair[pair['source'] == 'polymarket']
+            k_row = pair[pair['source'] == 'kalshi']
+
+            if pm_row.empty or k_row.empty:
+                continue
+
+            pm_item = pm_row.iloc[0]
+            k_item = k_row.iloc[0]
+
+            pm_prob = pm_item.get('probability') or 0
+            k_prob = k_item.get('probability') or 0
+            diff = abs(pm_prob - k_prob)
+            avg_prob = (pm_prob + k_prob) / 2.0
+
+            consensus_status = "Strong Agreement" if diff <= 3.0 else ("Moderate Agreement" if diff <= 8.0 else "Platform Divergence")
+            status_color = "#22c55e" if diff <= 3.0 else ("#f59e0b" if diff <= 8.0 else "#ef4444")
+            card_bg = "#1b202c" if st.session_state.dark_mode else "#ffffff"
+            card_border = "#282f40" if st.session_state.dark_mode else "#e2e8f0"
+            q_color = "#f8fafc" if st.session_state.dark_mode else "#0f172a"
+            tag_bg = "#242c3d" if st.session_state.dark_mode else "#f8fafc"
+
+            st.markdown(f"""
+            <div style='border: 1px solid {card_border}; border-radius: 8px; padding: 0.85rem 1rem; margin-bottom: 0.85rem; background: {card_bg};'>
+                <div style='display: flex; justify-content: space-between; align-items: center;'>
+                    <div style='font-size: 1.05rem; font-weight: 600; color: {q_color};'>{pm_item['question']}</div>
+                    <span style='color: {status_color}; font-size: 0.82rem; font-weight: 700; padding: 0.25rem 0.65rem; background: {tag_bg}; border-radius: 6px; border: 1px solid {card_border};'>
+                        {consensus_status} (Δ {diff:.1f}%)
+                    </span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                render_market_item(pm_item, prefix=f"comp_{gid}_pm")
+            with col2:
+                render_market_item(k_item, prefix=f"comp_{gid}_k")
+
+
+# ----------------------------------------------------------------------------
+# TAB 3: Watchlist
+# ----------------------------------------------------------------------------
+
+with tab_watchlist:
+    st.markdown("### Saved Watchlist")
+    st.markdown("<p style='color: #64748b; font-size: 0.9rem;'>Contracts pinned for ongoing strategic monitoring.</p>", unsafe_allow_html=True)
+
+    if not watchlist_ids:
+        st.info("Your watchlist is currently empty. Click '☆ Add to Watchlist' on any forecast card to pin it here.")
+    else:
+        watchlisted_df = df[df['id'].isin(watchlist_ids)]
+        if watchlisted_df.empty:
+            st.info("Saved markets are no longer active.")
         else:
-            # If navigating to specific group, show ONLY that group
-            if st.session_state.navigate_to_group and st.session_state.navigate_to_group in true_overlaps:
-                true_overlaps = [st.session_state.navigate_to_group]
-            
-            # Filter dataframe to only true overlaps
-            df_overlaps_only = df_with_overlaps[df_with_overlaps['duplicate_group_id'].isin(true_overlaps)]
-            grouped = df_overlaps_only.groupby('duplicate_group_id')
-            total_groups = len(grouped)
-            group_list = list(grouped.groups.keys())
-            
-            # Pagination for groups
-            total_pages = (total_groups + st.session_state.markets_per_page - 1) // st.session_state.markets_per_page
-            start_idx = (st.session_state.current_page - 1) * st.session_state.markets_per_page
-            end_idx = min(start_idx + st.session_state.markets_per_page, total_groups)
-            
-            st.subheader(f"Overlapping Markets ({total_groups} groups) | Page {st.session_state.current_page}/{total_pages}")
-            
-            # Display groups for current page
-            for group_idx in range(start_idx, end_idx):
-                group_id = group_list[group_idx]
-                group_markets = grouped.get_group(group_id).reset_index(drop=True)
-                
-                with st.container(border=True):
-                    # Side-by-side comparison of platforms (with questions)
-                    platform_cols = st.columns(len(group_markets))
-                    
-                    for col_idx, (_, market) in enumerate(group_markets.iterrows()):
-                        with platform_cols[col_idx]:
-                            source = market['source'].capitalize()
-                            source_color = COLORS["kalshi"] if source == "Kalshi" else COLORS["polymarket"]
-                            
-                            # Platform header
-                            st.markdown(f"<div style='background-color: {source_color}; color: white; padding: 8px; border-radius: 4px; text-align: center; font-weight: bold;'>{source}</div>", unsafe_allow_html=True)
-                            
-                            # Question text
-                            st.caption(f"**{market['question']}**")
-                            st.divider()
-                            
-                            # Probability
-                            prob = market['probability']
-                            prob_color = get_probability_color(prob)
-                            st.markdown(f"<div style='background-color: {prob_color}; color: white; padding: 8px; border-radius: 3px; text-align: center; margin: 8px 0; font-weight: bold;'>{prob:.0f}%</div>", unsafe_allow_html=True)
-                            
-                            # Details
-                            display_metric("Open Interest", format_oi(market['open_interest']))
-                            vol = market.get('volume', 0)
-                            vol_24h = market['volume_24h']
-                            display_metric("Total Volume", format_oi(vol) if vol else "$0", color=COLORS["polymarket"])
-                            display_metric("Volume (24h)", format_oi(vol_24h), color=COLORS["probability_high"])
-                            liq = market.get('liquidity', 0)
-                            display_metric("Liquidity", format_oi(liq) if liq else "$0", color=COLORS["liquidity"])
-                            
-                            # Favorites button
-                            in_watchlist = market['id'] in user_watchlist
-                            # Check if this item was updated in current session
-                            updated_state = st.session_state.watchlist_updates.get(market['id']) if 'watchlist_updates' in st.session_state else None
-                            display_in_watchlist = updated_state if updated_state is not None else in_watchlist
-                            
-                            if display_in_watchlist:
-                                if st.button("❤️", key=f"watch_{market['id']}", help="Remove from favorites"):
-                                    if remove_from_watchlist(market['id']):
-                                        st.toast("💔 Removed from favorites")
-                                        st.rerun()
-                            else:
-                                if st.button("🤍", key=f"watch_{market['id']}", help="Add to favorites"):
-                                    if add_to_watchlist(market['id']):
-                                        st.toast("❤️ Added to favorites")
-                                        st.rerun()
-                            
-                            # Category tag
-                            category = market.get('category', 'N/A')
-                            category_color = get_category_color(category)
-                            st.markdown(f"<span style='background-color: {category_color}; color: white; padding: 4px 8px; border-radius: 3px; font-size: 0.75rem; font-weight: 500;'>{category}</span>", unsafe_allow_html=True)
-            
-            # Pagination controls for groups
-            st.divider()
-            col_prev, col_center, col_next = st.columns([1, 2, 1])
-            with col_prev:
-                if st.button("← Previous", disabled=(st.session_state.current_page == 1), use_container_width=True):
-                    st.session_state.current_page -= 1
-                    st.rerun()
-            with col_center:
-                st.markdown(f"<div style='text-align: center; padding: 8px;'>Page {st.session_state.current_page} of {total_pages}</div>", unsafe_allow_html=True)
-            with col_next:
-                if st.button("Next →", disabled=(st.session_state.current_page == total_pages), use_container_width=True):
-                    st.session_state.current_page += 1
-                    st.rerun()
-
-else:
-    # Normal view: show each market individually
-    if total_markets == 0:
-        st.info("📭 No markets match your filters. Try adjusting your selection.")
-    else:
-        total_pages = (total_markets + st.session_state.markets_per_page - 1) // st.session_state.markets_per_page
-        start_idx = (st.session_state.current_page - 1) * st.session_state.markets_per_page
-        end_idx = min(start_idx + st.session_state.markets_per_page, total_markets)
-        
-        st.subheader(f"Markets ({total_markets}) | Page {st.session_state.current_page}/{total_pages}")
-    
-        # Display markets for current page
-        for idx in range(start_idx, end_idx):
-            row = df_filtered_sorted.iloc[idx]
-            in_watchlist = row['id'] in user_watchlist
-            
-            # Check if market has overlaps
-            has_overlaps = pd.notna(row['duplicate_group_id'])
-            
-            with st.container(border=True):
-                # Top row: Probability + Question + Platform/Overlap (top right)
-                col_prob, col_q, col_tags = st.columns([0.6, 3.2, 0.8])
-                
-                with col_prob:
-                    prob = row['probability']
-                    color = get_probability_color(prob)
-                    st.markdown(f"<div style='background-color: {color}; padding: 6px; border-radius: 4px; text-align: center; color: white; font-size: 1.3rem;'>{prob:.0f}%<br><span style=\"font-size: 0.65rem; font-style: italic;\">probability</span></div>", unsafe_allow_html=True)
-                
-                with col_q:
-                    st.caption(row['question'])  # Full question, no truncation
-                
-                with col_tags:
-                    # Platform tag
-                    source = row['source'].capitalize() if pd.notna(row['source']) else "Unknown"
-                    source_color = COLORS["kalshi"] if source == "Kalshi" else COLORS["polymarket"]
-                    st.markdown(f"<div style='background-color: {source_color}; color: white; padding: 4px 6px; border-radius: 3px; font-size: 0.8rem; text-align: center; font-weight: bold;'>{source}</div>", unsafe_allow_html=True)
-                    
-                    # Overlap tag (under platform)
-                    if has_overlaps:
-                        if st.button("🔗 Overlap", key=f"overlap_{row['id']}", help="View overlap group"):
-                            st.session_state.navigate_to_group = row['duplicate_group_id']
-                            st.session_state.show_overlaps_view = True
-                            st.rerun()
-                
-                # Details row
-                col_vol, col_oi, col_liq, col_watch = st.columns([1.2, 1.2, 1.2, 0.6])
-                
-                with col_vol:
-                    vol = row.get('volume', 0)
-                    vol_24h = row['volume_24h']
-                    display_metric("Total Volume", format_oi(vol) if vol else "$0", color=COLORS["polymarket"])
-                    display_metric("Volume (24h)", format_oi(vol_24h), color=COLORS["probability_high"])
-                
-                with col_oi:
-                    display_metric("Open Interest", format_oi(row['open_interest']))
-                
-                with col_liq:
-                    liq = row.get('liquidity', 0)
-                    display_metric("Liquidity", format_oi(liq) if liq else "$0", color=COLORS["liquidity"])
-                
-                with col_watch:
-                    in_watchlist = row['id'] in user_watchlist
-                    # Check if this item was updated in current session
-                    updated_state = st.session_state.watchlist_updates.get(row['id']) if 'watchlist_updates' in st.session_state else None
-                    display_in_watchlist = updated_state if updated_state is not None else in_watchlist
-                    
-                    if display_in_watchlist:
-                        if st.button("❤️", key=f"watch_{row['id']}", help="Remove from favorites"):
-                            if remove_from_watchlist(row['id']):
-                                st.toast("💔 Removed from favorites")
-                                st.rerun()
-                    else:
-                        if st.button("🤍", key=f"watch_{row['id']}", help="Add to favorites"):
-                            if add_to_watchlist(row['id']):
-                                st.toast("❤️ Added to favorites")
-                                st.rerun()
-                
-                # Bottom row: Category tag (bottom left)
-                col_cat, col_spacer = st.columns([1.5, 3])
-                with col_cat:
-                    category = row.get('category', 'N/A')
-                    category_color = get_category_color(category)
-                    st.markdown(f"<span style='background-color: {category_color}; color: white; padding: 4px 8px; border-radius: 3px; font-size: 0.75rem; font-weight: 500;'>{category}</span>", unsafe_allow_html=True)
-        
-        # Pagination controls
-        st.divider()
-        col_prev, col_center, col_next = st.columns([1, 2, 1])
-        with col_prev:
-            if st.button("← Previous", disabled=(st.session_state.current_page == 1), use_container_width=True):
-                st.session_state.current_page -= 1
-                st.rerun()
-        with col_center:
-            st.markdown(f"<div style='text-align: center; padding: 8px;'>Page {st.session_state.current_page} of {total_pages}</div>", unsafe_allow_html=True)
-        with col_next:
-            if st.button("Next →", disabled=(st.session_state.current_page == total_pages), use_container_width=True):
-                st.session_state.current_page += 1
-                st.rerun()
-
+            for _, row in watchlisted_df.iterrows():
+                render_market_item(row, prefix="wl")

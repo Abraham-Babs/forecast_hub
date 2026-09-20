@@ -62,6 +62,25 @@ async def fetch_oi(client: httpx.AsyncClient, condition_id: str) -> float | None
         return None
 
 
+def is_crypto_price_bet(question: str) -> bool:
+    """Identify pure crypto token price bets while preserving regulatory/policy matters."""
+    q = question.lower()
+    crypto_terms = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "doge", "xrp", "crypto"]
+    if not any(term in q for term in crypto_terms):
+        return False
+    policy_terms = [
+        "sec", "bill", "etf", "reserve", "treasury", "ban", "legal", 
+        "law", "regulation", "cftc", "tariff", "government", "congress", "senate", "president"
+    ]
+    if any(p in q for p in policy_terms):
+        return False
+    price_markers = [
+        "hit $", "reach $", "dip to $", "price of", "above $", "below $", 
+        "up or down", "all-time high", "ath", "market cap of"
+    ]
+    return any(pm in q for pm in price_markers)
+
+
 async def process_market(
     client: httpx.AsyncClient, 
     market: dict, 
@@ -69,7 +88,11 @@ async def process_market(
     seen: set, 
     lock: asyncio.Lock
 ) -> dict | None:
-    """Process and enrich market with OI. Returns normalized dict or None."""
+    """Process, filter, and enrich market with OI, topic title, rules, and URLs."""
+    question = market.get("question") or ""
+    if not question or is_crypto_price_bet(question):
+        return None
+
     cond_id = market.get("conditionId")
     if cond_id is None:
         return None
@@ -95,16 +118,32 @@ async def process_market(
         prob = None
         if outcomes and prices and "Yes" in outcomes:
             prob = float(prices[outcomes.index("Yes")]) * 100
+
+        # Extract parent event topic if present
+        events = market.get("events")
+        topic_title = question
+        if isinstance(events, list) and len(events) > 0 and events[0].get("title"):
+            topic_title = events[0]["title"]
+        elif market.get("groupItemTitle"):
+            topic_title = market.get("groupItemTitle")
+
+        slug = market.get("slug")
+        url = f"https://polymarket.com/market/{slug}" if slug else ""
         
         return {
             "id": market["id"],
-            "question": market["question"],
+            "topic_title": topic_title,
+            "question": question,
             "probability": prob,
             "volume": float(market.get("volume", 0)),
             "volume_24h": float(market.get("volume24hr", 0)),
             "open_interest": oi,
             "category": category,
             "liquidity": float(market.get("liquidity") or market.get("liquidityNum", 0)),
+            "end_date": market.get("endDate"),
+            "rules": market.get("description") or "",
+            "url": url,
+            "source": "polymarket"
         }
     except Exception:
         return None

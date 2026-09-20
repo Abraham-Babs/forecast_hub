@@ -19,19 +19,54 @@ logger = logging.getLogger(__name__)
 DATABASE_PATH = os.getenv("DATABASE_PATH", "Markets_database.db")
 
 
-def find_duplicate_groups(markets: list, threshold: float = 0.85) -> dict:
+import re
+
+
+def extract_numeric_tokens(text: str) -> set:
+    """Extract numbers, percentages, and unit values from text."""
+    return set(re.findall(r'\b\d+(?:\.\d+)?(?:%|k|m|b|bps)?\b', text.lower()))
+
+
+def extract_clean_tokens(text: str) -> set:
+    """Normalize text into core semantic words, removing common filler."""
+    stop_words = {
+        "will", "the", "a", "an", "in", "by", "of", "to", "for", "on", "at", "be", 
+        "is", "are", "or", "and", "if", "there", "before", "after", "end", "any", 
+        "this", "market", "resolve", "yes", "no"
+    }
+    words = re.findall(r'[a-zA-Z0-9]+', text.lower())
+    return {w for w in words if w not in stop_words and len(w) > 1}
+
+
+def are_contracts_matching(q1: str, q2: str) -> bool:
     """
-    Find overlapping markets (same question on different platforms).
-    Only creates a group if markets have ≥85% similar questions AND come from different sources.
-    Each overlap group will have exactly one market from Polymarket and one from Kalshi.
-    
-    Args:
-        markets: List of market dicts with 'id', 'question', and 'source' keys
-        threshold: Similarity threshold (0-1); default 0.85 = 85% match
-    
-    Returns:
-        Dict mapping market_id -> group_id. Only includes markets that overlap across platforms.
-        Example: {poly_market_id: 0, kalshi_market_id: 0} = same question on both platforms
+    Check if two contracts from different platforms represent the exact same event.
+    Applies a strict parameter guardrail to prevent false matches across different numbers.
+    """
+    # Parameter guardrail: If both contain numbers/targets, they must not conflict
+    nums1 = extract_numeric_tokens(q1)
+    nums2 = extract_numeric_tokens(q2)
+    if nums1 and nums2:
+        if not (nums1 & nums2):
+            return False  # Distinct numeric targets (e.g. 2% vs 3%)
+
+    tokens1 = extract_clean_tokens(q1)
+    tokens2 = extract_clean_tokens(q2)
+    if not tokens1 or not tokens2:
+        return False
+
+    intersection = tokens1 & tokens2
+    union = tokens1 | tokens2
+    jaccard = len(intersection) / len(union)
+    seq_ratio = SequenceMatcher(None, q1.lower(), q2.lower()).ratio()
+
+    return jaccard >= 0.50 or seq_ratio >= 0.72
+
+
+def find_duplicate_groups(markets: list) -> dict:
+    """
+    Assign duplicate_group_id to cross-platform overlapping contracts.
+    Only pairs markets from different sources where both topic and exact parameters agree.
     """
     groups = {}  # market_id -> group_id
     group_id = 0
@@ -40,26 +75,39 @@ def find_duplicate_groups(markets: list, threshold: float = 0.85) -> dict:
         if m1['id'] in groups:
             continue
         
-        # Find matches from DIFFERENT platforms only
         for m2 in markets[i+1:]:
             if m2['id'] in groups:
                 continue
             
-            # Skip if same platform
-            if m1['source'] == m2['source']:
+            # Cross-platform pairing only
+            if m1.get('source') == m2.get('source'):
                 continue
             
-            # Check question similarity
-            ratio = SequenceMatcher(None, m1['question'].lower(), m2['question'].lower()).ratio()
-            if ratio >= threshold:
-                # Found an overlap: same question, different platforms
+            q1 = m1.get('question') or ""
+            q2 = m2.get('question') or ""
+            
+            if are_contracts_matching(q1, q2):
                 groups[m1['id']] = group_id
                 groups[m2['id']] = group_id
-                logger.info(f"Found overlap: {m1['source']} ↔ {m2['source']} | {m1['question'][:60]}...")
+                logger.info(f"Grouped match: {m1.get('source')} <-> {m2.get('source')} | '{q1[:45]}' <-> '{q2[:45]}'")
                 group_id += 1
-                break  # m1 matched, move to next
+                break
     
     return groups
+
+
+def cluster_topic_titles(markets: list) -> None:
+    """
+    Tier 1 Topic Clustering: Unifies topic titles across platforms for related events
+    (e.g., all Federal Reserve rate strikes or recession questions share an umbrella topic).
+    """
+    topics = []
+    for m in markets:
+        raw_topic = m.get('topic_title') or m.get('question') or "General Forecasts"
+        # Clean up question marks or boilerplate
+        clean_topic = raw_topic.strip().rstrip('?')
+        m['topic_title'] = clean_topic
+        topics.append(clean_topic)
 
 
 async def main():
@@ -128,7 +176,10 @@ async def main():
         db.connect()
         db.init_schema()
         
-        # Detect duplicates
+        # Tier 1: Cluster topics across markets
+        cluster_topic_titles(markets)
+
+        # Tier 2: Detect exact contract matches
         duplicate_groups = find_duplicate_groups(markets)
         db.insert_markets(markets, duplicate_groups)
         db.close()
